@@ -1,0 +1,9 @@
+# The build runs on Windows; the containers read these files on Linux.
+# Without this, CRLF in a shell script or a Lua file breaks at runtime in ways
+# that are genuinely painful to diagnose.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gz  binary
+*.jar binary

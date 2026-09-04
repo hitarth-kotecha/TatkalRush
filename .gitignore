@@ -1,0 +1,25 @@
+target/
+*.class
+
+.idea/
+*.iml
+.vscode/
+.settings/
+.classpath
+.project
+
+node_modules/
+dist/
+.vite/
+
+*.log
+.DS_Store
+Thumbs.db
+
+# Benchmark runs are COMMITTED, including failures (NFR-14). Do not ignore
+# docs/benchmarks/ - the history of what broke is the most interesting document
+# in this repository.
+
+# Claude Code local overrides. .claude/settings.json (shared) would be committed;
+# settings.local.json is per-machine.
+.claude/settings.local.json

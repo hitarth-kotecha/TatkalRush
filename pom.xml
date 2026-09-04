@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.tatkalrush</groupId>
+  <artifactId>tatkal-rush</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>TatkalRush</name>
+  <description>Railway seat reservation under extreme write contention. See tatkal-rush-sdd-v1.2.md</description>
+
+  <!--
+    Custom root parent. spring-boot-dependencies is IMPORTED as a BOM rather than
+    inherited via spring-boot-starter-parent (SDD 8.2, DD-005), so modules get
+    version management without inheriting a build configuration that would fight
+    the per-module compiler flags SDD 8.5 needs.
+
+    Dependencies point inward only. A module that does not declare another cannot
+    resolve its classes at all, so an inward-pointing dependency is a COMPILE
+    ERROR here, not merely an ArchUnit assertion (AC-0.4).
+  -->
+
+  <modules>
+    <module>domain</module>
+    <module>application</module>
+    <module>adapters</module>
+    <module>admission</module>
+    <module>ops</module>
+    <module>app</module>
+    <module>archtest</module>
+    <module>differential</module>
+  </modules>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <maven.compiler.release>25</maven.compiler.release>
+
+    <!--
+      Pinned EXACTLY, no ranges and no "+" (SDD 8.4, DD-003). A version table
+      containing a "+" is how two builds end up on different minors.
+    -->
+    <spring-boot.version>4.0.8</spring-boot.version>
+    <archunit.version>1.5.0</archunit.version>
+
+    <maven-compiler-plugin.version>3.14.1</maven-compiler-plugin.version>
+    <maven-surefire-plugin.version>3.5.6</maven-surefire-plugin.version>
+    <maven-enforcer-plugin.version>3.6.3</maven-enforcer-plugin.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-dependencies</artifactId>
+        <version>${spring-boot.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <!--
+        ArchUnit CORE only. The archunit-junit5 artifact drags in JUnit platform
+        1.14.4, which collides with the 6.0.3 the Spring Boot BOM supplies; core
+        depends on slf4j-api alone. Established by the Task 1 spike, DD-020.
+      -->
+      <dependency>
+        <groupId>com.tngtech.archunit</groupId>
+        <artifactId>archunit</artifactId>
+        <version>${archunit.version}</version>
+        <scope>test</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>${maven-compiler-plugin.version}</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>${maven-surefire-plugin.version}</version>
+          <configuration>
+            <!--
+              Surefire defaults match Test*, *Test, *Tests, *TestCase only.
+              Property classes conventionally end in "Properties" and would be
+              SILENTLY NOT RUN, giving a green build that executed nothing.
+              Found by the Task 1 spike; it would have hidden T-4 and T-7.
+            -->
+            <includes>
+              <include>**/*Test.java</include>
+              <include>**/*Tests.java</include>
+              <include>**/*Properties.java</include>
+            </includes>
+          </configuration>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-enforcer-plugin</artifactId>
+          <version>${maven-enforcer-plugin.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

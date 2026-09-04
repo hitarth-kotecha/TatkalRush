@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.tatkalrush</groupId>
+    <artifactId>tatkal-rush</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>differential</artifactId>
+  <name>differential (T-7: Java reference vs Lua script equivalence)</name>
+
+  <!--
+    Home of T-7, the differential test that proves the Lua implementation of the
+    allocation algorithm is step-for-step equivalent to the Java reference in
+    domain/inventory (SDD 9.1, Appendix A, DD-001). It is an AC-1.7 gate and it is
+    what makes SDD 9.4 a controlled comparison rather than a comparison of two
+    different programs.
+
+    Its own module because it belongs to neither side it compares: it needs
+    domain/inventory AND the real allocate.lua on a Testcontainers Redis.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>domain</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>allocator-redis</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+</project>
