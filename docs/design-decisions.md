@@ -61,6 +61,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-028](#dd-028) | Correlation id lives in a ScopedValue, and also in the MDC | 0 |
 | [DD-029](#dd-029) | AC-0.7's threshold is replaced by a derived floor; OQ-2 closes | 0 |
 | [DD-030](#dd-030) | TATKAL pool size is FR-9's, not a number I chose | 0 |
+| [DD-031](#dd-031) | Strategy A needs three Redis keys §10.5 does not list | 1 |
 
 ---
 
@@ -1671,6 +1672,93 @@ about genuinely open questions.
 FR-9 changing. Nothing else — this is a requirement, not a tuning parameter, and
 if a future measurement suggests a different Tatkal share, that is an argument to
 amend FR-9 deliberately and record the amendment, not to drift the constant.
+
+---
+
+<a id="dd-031"></a>
+### DD-031 — Strategy A needs three Redis keys §10.5 does not list
+
+Date: 2026-09-04 · Author: Phase 1a · Phase: 1 · Requirements: §9.2, §10.5, AC-1.6
+Supersedes: —
+
+**Context.**
+
+§10.5 specifies three keys per quota pool: `masks:`, `freecount:` and `holds:`,
+plus a per-hold `hold:{holdId}` hash. Implementing `allocate.lua` against that
+layout does not work, for three separate reasons.
+
+**The reap loop needs each expired hold's detail.** Step 1 of §9.2's outline
+reads expired hold ids from the `holds:` ZSET and clears their bits — which
+requires knowing which berths and which mask each one held. With detail in a
+per-*hold* key, the script would have to construct `hold:{id}` for ids it only
+discovers at run time, i.e. touch keys it never declared in `KEYS`. That is
+forbidden in Redis Cluster and merely undeclared on a single node, which is worse
+— it works until it doesn't.
+
+**`release(holdId)` and `confirm(holdId)` carry no pool.** The port's signatures
+(§9.1) take only a hold id, but every script needs the pool's four keys. The
+mapping cannot live in the JVM: any replica may serve the release for a hold
+another replica created, and it must survive an app restart.
+
+**The scripts need the pool's shape.** Both validate the caller's segment count
+against the provisioned blob, which means the adapter has to know it without a
+Postgres round trip on the hot path.
+
+**Decision.**
+
+Three keys added, all per pool except the last:
+
+| Key | Type | Why |
+|---|---|---|
+| `holddetail:{pool}` | HASH, holdId → `"lo:hi:ord,ord"` | One key per *pool*, so the reap loop reads every expired hold's detail from a key it declared |
+| `poolmeta:{pool}` | HASH, berths + segments | Pool shape, cached per JVM after first read |
+| `holdpool:{holdId}` | STRING → pool suffix | Resolves a hold to its pool, with a TTL 60 s beyond the hold's own |
+
+§10.5's `hold:{holdId}` remains for the application-level view a booking needs
+(berths, bookingId); it is not what the allocator reaps from.
+
+**Alternatives considered.**
+
+1. **Keep detail in `hold:{holdId}` and construct keys inside the script.** Rejected:
+   it makes the script cluster-hostile and, on a single node, silently dependent
+   on undeclared-key access. The SDD's own deployment is single-node (§8.3), so
+   this would appear to work indefinitely and fail the moment anyone tried to
+   scale Redis — the class of decision that is cheap now and expensive later.
+
+2. **Resolve the pool in the JVM, from a map populated at allocate time.** Rejected:
+   two replicas serve the same user (§8.3's nginx round-robins), so the replica
+   that releases a hold is frequently not the one that created it. It would also
+   lose every mapping on restart, turning explicit releases into silent no-ops
+   that wait out the lazy reaper — inventory held for a full TTL for no reason,
+   with nothing reporting it.
+
+3. **Read the pool shape from Postgres per allocation.** Rejected outright: it
+   adds a database round trip to the hot path that Strategy A exists to keep off
+   it, and would show up in §9.4 as Strategy A being slow — an artefact of the
+   adapter presented as a property of the strategy.
+
+**Consequences.**
+
+Three more keys to rebuild after chaos C2's `FLUSHALL`. `holddetail:` and
+`poolmeta:` are handled by `init-pool.lua`; `holdpool:` deliberately is not,
+because in-flight holds are lost on Redis loss anyway (§9.2) and recreating their
+pool mappings would imply they survived.
+
+`release` and `confirm` cost two round trips rather than one: resolve the pool,
+then run the script. Both are off the hot path — allocation is what a spike
+multiplies — so the simplicity is worth more than the round trip.
+
+The berth-id mapping is currently derived arithmetically rather than read from
+`pool_berths`, matching the seed generator's scheme. That is a Phase 1a
+placeholder and is called out in the adapter; Phase 1b caches the real mapping
+alongside the pool shape.
+
+**What would change this.**
+
+If Redis is ever sharded, `holdpool:{holdId}` lands in a different slot from its
+pool's keys and would need a hash tag, or folding into a per-pool structure.
+Nothing else here changes: the other two are already per-pool and would move with
+it.
 
 ---
 
