@@ -62,6 +62,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-029](#dd-029) | AC-0.7's threshold is replaced by a derived floor; OQ-2 closes | 0 |
 | [DD-030](#dd-030) | TATKAL pool size is FR-9's, not a number I chose | 0 |
 | [DD-031](#dd-031) | Strategy A needs three Redis keys §10.5 does not list | 1 |
+| [DD-032](#dd-032) | A PNR is issued at confirmation, and V4 said otherwise | 1 |
 
 ---
 
@@ -1759,6 +1760,94 @@ If Redis is ever sharded, `holdpool:{holdId}` lands in a different slot from its
 pool's keys and would need a hash tag, or folding into a per-pool structure.
 Nothing else here changes: the other two are already per-pool and would move with
 it.
+
+---
+
+<a id="dd-032"></a>
+### DD-032 — A PNR is issued at confirmation, and V4 said otherwise
+
+Date: 2026-09-05 · Author: Phase 1b · Phase: 1 · Requirements: §6.4, FR-26, FR-40
+Supersedes: — (corrects the `bookings.pnr` column introduced in V4)
+
+**Context.**
+
+§6.4 step 3 issues the PNR as part of the `HELD → CONFIRMED` transition. V4
+declared the column `pnr TEXT NOT NULL`, which forces one at hold time — the two
+cannot both be right, and the schema was wrong.
+
+Surfaced while writing the `HoldSeats` use case, at the point of asking what to
+put in the column for a booking that has not been paid for. Nothing in Phase 0
+had noticed, because every test that inserted a booking simply invented a PNR to
+satisfy the constraint.
+
+**Why it matters beyond tidiness.** FR-26 derives PNRs from a sequence.
+Issuing one per *hold* would consume a sequence value for every hold that expires
+unpaid — which during a Tatkal spike is the overwhelming majority of them. The
+PNR space would be burned through by traffic that never became a booking, and the
+numbers on real tickets would carry gaps proportional to how contended the train
+was.
+
+**Decision.**
+
+1. **V8 drops the `NOT NULL`** and adds a biconditional check:
+
+   ```sql
+   CHECK ((status IN ('CONFIRMED', 'CANCELLED')) = (pnr IS NOT NULL))
+   ```
+
+   A biconditional rather than two one-way checks, so it catches both errors: a
+   confirmed booking with no PNR (INV-6 cannot verify what is absent), and a held
+   booking that was issued one (a sequence value burned by a hold).
+
+2. **`FAILED_REFUNDED` is on the no-PNR side.** That path never reached
+   `CONFIRMED`: money was captured and returned without the booking ever being
+   seated (FR-24, FR-25), so there is nothing to print on a ticket.
+
+3. **`CANCELLED` keeps its PNR**, so a cancelled ticket remains lookupable.
+
+**Alternatives considered.**
+
+1. **Edit V4 in place.** Rejected, and this is the more interesting half of the
+   decision. The project is young enough that no environment outside this machine
+   and CI has run V4, so editing it would "work". But applied migrations are
+   immutable: changing V4's contents changes its checksum, and Flyway then refuses
+   to start against any database that ran the original — correctly, because "the
+   schema is what the migrations say" is the assumption every invariant check
+   rests on. Learning that habit on a project where it costs nothing is the point
+   of having the habit.
+
+2. **Keep `NOT NULL` and issue a PNR at hold time.** Rejected: it contradicts
+   §6.4's sequence, and it burns the PNR space in proportion to contention, which
+   is exactly backwards — the busier the train, the faster the numbering degrades.
+   A sequence gap is not a correctness bug, but "PNRs jump by thousands on popular
+   trains" is a question with no good answer.
+
+3. **A sentinel value such as an empty string.** Rejected outright: it makes the
+   unique index useless (every held booking collides on `''`), and it replaces a
+   representable absence with a magic value that every reader must know about.
+
+**Consequences.**
+
+Two Phase 0 test fixtures were inserting held bookings with PNRs and had to be
+corrected. Both were wrong before V8; the constraint is what made them say so.
+
+One of those corrections improved an unrelated test. `IdempotencyRaceTest`'s
+check-then-act mutation previously failed on a PNR unique violation, which sent a
+reader after the PNR generator rather than the race. With no PNR on a held
+booking, the only thing that can fail is the allocation count — which is what T-5
+is about.
+
+A fixture failing partway through also revealed that `seedMinimalBooking` guarded
+on its *last* insert, so a failure left earlier rows behind and the next call
+re-inserted them, burying one real error under a cascade of unique violations. It
+now guards on the first.
+
+**What would change this.**
+
+If RAC or WL bookings turn out to need a PNR before confirmation — FR-40 says they
+are "still paid bookings with PNRs", and Phase 3a will settle whether their
+lifecycle differs — the biconditional needs a third state on the PNR side, and
+this entry is superseded rather than edited.
 
 ---
 

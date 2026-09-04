@@ -245,7 +245,11 @@ class SchemaMigrationTest {
 
     /** Minimal referential scaffolding so seat_allocations' foreign keys resolve. */
     private void seedMinimalBooking() throws SQLException {
-        if (queryInt("SELECT count(*) FROM bookings") > 0) {
+        // Guarded on stations rather than bookings. Guarding on the LAST insert
+        // means a failure partway through leaves the earlier rows behind and the
+        // next call re-inserts them, turning one real failure into a cascade of
+        // unrelated unique-violation errors that bury it.
+        if (queryInt("SELECT count(*) FROM stations") > 0) {
             return;
         }
         try (Statement st = connection.createStatement()) {
@@ -264,10 +268,14 @@ class SchemaMigrationTest {
                         + " VALUES (1,'2026-10-01','OPEN','2026-10-01 16:55+05:30'),"
                         + "        (1,'2026-10-02','OPEN','2026-10-02 16:55+05:30')");
             st.execute("INSERT INTO users (external_ref) VALUES ('user-0001')");
+            // No PNR: §6.4 issues one at CONFIRMATION, and V8's CHECK enforces
+            // that a HELD booking has none. This insert carried 'PNR0000001'
+            // until V8 landed and rejected it - the constraint catching a
+            // fixture that had been quietly wrong since Phase 0.
             st.execute(
-                    "INSERT INTO bookings (pnr, schedule_id, travel_class, quota_type, from_seq,"
+                    "INSERT INTO bookings (schedule_id, travel_class, quota_type, from_seq,"
                         + " to_seq, status, booking_class, passenger_count, fare_paise, user_id)"
-                        + " VALUES ('PNR0000001',1,'SL','TATKAL',0,4,'HELD','CNF',1,145000,1)");
+                        + " VALUES (1,'SL','TATKAL',0,4,'HELD','CNF',1,145000,1)");
         }
     }
 

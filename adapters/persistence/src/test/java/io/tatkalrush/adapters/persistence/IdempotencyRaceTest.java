@@ -6,10 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.tatkalrush.application.ports.IdempotencyStore.Claim;
 import java.sql.Connection;
-import io.tatkalrush.domain.booking.Pnr;
 import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.List;
@@ -111,32 +108,29 @@ class IdempotencyRaceTest {
      */
     private static long allocateAndCreateBooking(Connection connection, AtomicInteger allocations)
             throws SQLException {
-        int attempt = allocations.incrementAndGet();
+        allocations.incrementAndGet();
 
-        // A DISTINCT PNR per allocation, deliberately.
+        // A HELD booking carries NO PNR. §6.4 issues one as part of the
+        // HELD -> CONFIRMED transition, and V8's CHECK now enforces that.
         //
-        // An earlier version hardcoded one. That still failed under a
-        // check-then-act mutation - but on "duplicate key value violates unique
-        // constraint bookings_pnr_key", which sends a reader after the PNR
-        // generator instead of the race. A test's failure message is part of the
-        // test: this way the assertion below reports the allocation count, which
-        // is what T-5 is actually about.
-        String pnr = Pnr.fromSequence(attempt).value();
-
-        try (PreparedStatement insert =
-                connection.prepareStatement(
-                        """
-                        INSERT INTO bookings (pnr, schedule_id, travel_class, quota_type,
-                            from_seq, to_seq, status, booking_class, passenger_count,
-                            fare_paise, user_id)
-                        VALUES (?, 1, 'SL', 'TATKAL', 0, 4, 'HELD', 'CNF', 1, 212050, 1)
-                        RETURNING id
-                        """)) {
-            insert.setString(1, pnr);
-            try (ResultSet rs = insert.executeQuery()) {
-                rs.next();
-                return rs.getLong(1);
-            }
+        // This also removes a confound that made an earlier version of this test
+        // diagnose badly: with a hardcoded PNR, a check-then-act mutation failed
+        // on "duplicate key value violates unique constraint bookings_pnr_key",
+        // sending a reader after the PNR generator rather than the race. With no
+        // PNR at all, the only thing that can fail is the allocation count -
+        // which is what T-5 is about.
+        try (Statement st = connection.createStatement()) {
+            var rs =
+                    st.executeQuery(
+                            """
+                            INSERT INTO bookings (schedule_id, travel_class, quota_type,
+                                from_seq, to_seq, status, booking_class, passenger_count,
+                                fare_paise, user_id)
+                            VALUES (1, 'SL', 'TATKAL', 0, 4, 'HELD', 'CNF', 1, 212050, 1)
+                            RETURNING id
+                            """);
+            rs.next();
+            return rs.getLong(1);
         }
     }
 
