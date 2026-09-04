@@ -246,7 +246,7 @@ Requires Docker, JDK 25 and Maven.
 
 ```bash
 docker compose up -d --wait     # full stack, ~32 s
-mvn -B clean verify             # 68 tests, ~1.5 min (needs Docker for Testcontainers)
+mvn -B clean verify             # 102 tests, ~1.5 min (needs Docker for Testcontainers)
 ```
 
 The stack fits in 4.5 GB. On WSL2, copy [`ops/wsl/.wslconfig`](ops/wsl/.wslconfig)
