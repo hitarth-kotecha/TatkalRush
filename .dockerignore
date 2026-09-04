@@ -1,0 +1,20 @@
+# Keep the build context small. Everything sent here is uploaded to the daemon
+# on every build, and a fat context is a slow NFR-10.
+
+.git/
+.github/
+.claude/
+
+**/target/
+**/node_modules/
+**/dist/
+
+ui/
+loadtest/
+
+docs/
+*.md
+
+.idea/
+.vscode/
+*.iml

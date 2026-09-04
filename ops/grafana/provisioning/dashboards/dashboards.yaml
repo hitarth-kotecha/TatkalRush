@@ -1,0 +1,18 @@
+# Dashboard provider. The three dashboards of SDD §15.2 are added as JSON under
+# ops/grafana/dashboards/ during Phase 1c (AC-1.9):
+#
+#   1. Tatkal Rush        - the demo dashboard, 30 s window. README screenshot.
+#   2. Strategy Comparison - same panels, A vs B, from separate runs.
+#   3. System Health      - JVM, pools, Redis ops/s, consumer lag, PG locks.
+
+apiVersion: 1
+
+providers:
+  - name: tatkal-rush
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

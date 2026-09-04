@@ -1,0 +1,43 @@
+# Copy to C:\Users\<you>\.wslconfig, then: wsl --shutdown
+#
+# WHY THIS IS COMMITTED (DD-019, AC-0.7)
+#
+# Docker Desktop runs on WSL2, which by default claims roughly 50% of host RAM.
+# "Roughly half of whatever machine you happen to be on" is not a reproducible
+# memory budget, and NFR-11 is a number this project publishes. Without this
+# file, the memory available to the stack differs silently between machines and
+# every benchmark becomes unreproducible - which defeats NFR-13's promise that
+# the report says honestly what was measured.
+#
+# Sized for the 7.91 GB build machine:
+#
+#   7.91 GB  total physical
+#  -3.00 GB  Windows + Docker Desktop + editor
+#  -0.60 GB  k6, co-located during load runs (NFR-13)
+#  ========
+#   ~4.3 GB  available to the Docker stack -> NFR-11 ceiling of 4.5 GB
+#
+# The stack's committed mem_limits total ~3.5 GB (compose.yaml), so 5 GB here
+# leaves the VM room for page cache and the container runtime itself without
+# letting it grow into the host's working set.
+#
+# On a different machine: re-run AC-0.7 and supersede DD-019 rather than editing
+# these numbers in place. The old figures must stay auditable alongside the
+# benchmarks they produced.
+
+[wsl2]
+memory=5GB
+processors=6
+swap=2GB
+
+# Reclaim freed memory back to Windows instead of holding the high-water mark.
+# Without this the VM keeps whatever a load run peaked at, and the next run
+# starts with less host memory than the last.
+autoMemoryReclaim=gradual
+
+# Sparse VHD keeps the disk image from growing monotonically across the many
+# rebuild cycles a 14-21 week project accumulates.
+sparseVhd=true
+
+[experimental]
+networkingMode=mirrored

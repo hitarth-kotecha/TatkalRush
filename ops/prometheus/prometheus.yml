@@ -1,0 +1,34 @@
+# Prometheus scrape config (SDD §15.1).
+#
+# 5 s scrape interval: P1's spike is 30 s wide, so a 15 s default would give
+# two samples across the entire headline scenario. Anything coarser cannot
+# resolve the shape of the spike, which is the thing the demo dashboard exists
+# to show.
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+  external_labels:
+    stack: tatkal-rush
+
+scrape_configs:
+  - job_name: tatkal-app
+    metrics_path: /actuator/prometheus     # API-11
+    static_configs:
+      # Scraped per replica, NOT through nginx. Going through the load balancer
+      # would round-robin the scrape between replicas and produce one series
+      # that is really two, which makes per-replica leaks and imbalance
+      # invisible - exactly what the System Health dashboard needs to show.
+      - targets: ["app-1:8080"]
+        labels: {replica: app-1}
+      - targets: ["app-2:8080"]
+        labels: {replica: app-2}
+
+  - job_name: psp-sim
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["psp-sim:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

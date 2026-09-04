@@ -1,0 +1,282 @@
+# TatkalRush stack (SDD §8.3). Target: `docker compose up` healthy in ≤120 s
+# (NFR-10) inside 4.5 GB resident (NFR-11, amended by DD-019).
+#
+# MEMORY IS THE BINDING CONSTRAINT. The build machine has 7.91 GB total; Windows,
+# Docker Desktop and an editor take ~3 GB, and k6 needs ~0.6 GB co-located during
+# a load run. Every service therefore carries an explicit mem_limit, so a leak
+# surfaces as one named container being OOM-killed rather than as the whole host
+# swapping. Committed total is ~3.5 GB, leaving headroom for page cache.
+#
+# All images pinned by digest (SDD §8.4). Refresh via ops/docker/refresh-digests.sh.
+
+name: tatkal-rush
+
+# Backing-service wiring, shared by every service that runs the app image.
+#
+# This is a SEPARATE anchor from x-app-base on purpose. A YAML merge key
+# replaces a mapping wholesale rather than deep-merging it, so a service that
+# declares `environment:` to override one variable silently discards all the
+# others. That cost a debugging cycle: psp-sim came up with only its profile set
+# and died on "Failed to configure a DataSource". Merging at the map level, as
+# below, is the shape that actually composes.
+x-app-env: &app-env
+  SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/tatkal
+  SPRING_DATASOURCE_USERNAME: tatkal
+  SPRING_DATASOURCE_PASSWORD: tatkal
+  SPRING_DATA_REDIS_HOST: redis
+  SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+
+x-app-base: &app-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: tatkal-rush/app:dev
+  depends_on:
+    postgres: {condition: service_healthy}
+    redis: {condition: service_healthy}
+    kafka: {condition: service_healthy}
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://localhost:8080/actuator/health/readiness"]
+    interval: 5s
+    timeout: 3s
+    retries: 20
+    start_period: 40s
+  restart: unless-stopped
+
+services:
+
+  # --- data plane -----------------------------------------------------------
+
+  postgres:
+    image: postgres@sha256:075f7ba66bc9b3ce7d6b8b635208ff61cd7cf1a67d71ec530eec5d7ae0cbe571
+    mem_limit: 512m
+    environment:
+      POSTGRES_DB: tatkal
+      POSTGRES_USER: tatkal
+      POSTGRES_PASSWORD: tatkal
+      # Skips fsync on initdb only; the running server keeps its durability
+      # guarantees. Shaves several seconds off NFR-10's cold start.
+      POSTGRES_INITDB_ARGS: "--nosync"
+    command:
+      - postgres
+      # shared_buffers is Postgres's own page cache. Left at its default the
+      # server sizes itself for a real machine and gets OOM-killed inside a
+      # 512m container partway through seeding.
+      - -c
+      - shared_buffers=192MB
+      - -c
+      - max_connections=120
+      - -c
+      - work_mem=4MB
+      # The EXCLUDE constraint in §10.2 is a GiST index; give the planner a
+      # reason to prefer it and log anything pathological during P4.
+      - -c
+      - log_min_duration_statement=2000
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tatkal -d tatkal"]
+      interval: 3s
+      timeout: 3s
+      retries: 25
+      start_period: 10s
+
+  redis:
+    image: redis@sha256:1db42ccef14898aa29bae778452d567534b59c107129cbc1163fb552de184d3c
+    mem_limit: 512m
+    command:
+      - redis-server
+      - --maxmemory
+      - 384mb
+      # noeviction is NOT a tuning choice. Redis holds live seat holds (§10.5);
+      # silently evicting one would release berths nobody released, and INV-8
+      # would find the drift long after the customer saw a confirmation.
+      # Better to fail the write loudly.
+      - --maxmemory-policy
+      - noeviction
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  kafka:
+    image: apache/kafka@sha256:d50ab7b5df612b3c303f9d8afe8fee59626a5de798addfd626fe1924e3205965
+    mem_limit: 1024m
+    environment:
+      # KRaft: no ZooKeeper, one less container at this budget (§8.3).
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      # replication.factor=1 with min.insync.replicas=1 is a DELIBERATE single
+      # point of failure (§8.3), accepted so the whole stack fits on one laptop.
+      # It must be called out in the ADR and the README, not quietly assumed
+      # away. Chaos scenario C4 restarts this broker precisely to show what the
+      # system does when that SPOF blinks.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+
+      # 12 partitions is a design decision, not a default (§8.3): it is the
+      # upper bound on Strategy B's write parallelism, since one partition means
+      # one owner thread. Twelve across two replicas gives six each - enough
+      # that P3 still concentrates load on one owner, which is that test's whole
+      # point. Do not raise it; over-partitioning inflates rebalance time and
+      # hurts NFR-8.
+      KAFKA_NUM_PARTITIONS: "12"
+
+      KAFKA_LOG_RETENTION_HOURS: "24"
+      KAFKA_LOG_SEGMENT_BYTES: "67108864"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_HEAP_OPTS: "-Xms640m -Xmx640m"
+    ports: ["9092:9092"]
+    healthcheck:
+      # A real readiness probe. Kafka accepts TCP connections well before it
+      # will serve an API request, so "port is open" is a lie and AC-0.1
+      # explicitly rejects a fixed sleep.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 20s
+
+  # --- application ----------------------------------------------------------
+
+  app-1:
+    <<: *app-base
+    container_name: tatkal-app-1
+    mem_limit: 512m
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: docker
+
+  # Both replicas are REQUIRED, not redundancy for its own sake: chaos scenario
+  # C1 kills one at spike peak, and NFR-8's rebalance path only exists with a
+  # survivor to rebalance onto.
+  app-2:
+    <<: *app-base
+    container_name: tatkal-app-2
+    mem_limit: 512m
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: docker
+
+  psp-sim:
+    <<: *app-base
+    container_name: tatkal-psp-sim
+    mem_limit: 256m
+    environment:
+      <<: *app-env
+      SPRING_PROFILES_ACTIVE: docker,psp-sim
+      # Heap must be set BELOW the container limit, not inherited. The image
+      # default is -Xmx320m, sized for app-1/app-2's 512m cap; inside psp-sim's
+      # 256m cap that gives the JVM a heap ceiling larger than its cgroup, and
+      # the first measurement showed it sitting at 98.6% of the limit - one
+      # allocation away from an OOM kill that would look like a PSP outage
+      # during C5.
+      JAVA_OPTS: "-Xms96m -Xmx160m -XX:+UseSerialGC -XX:MaxMetaspaceSize=96m"
+    # Simulated payment provider with controllable latency and failure rates
+    # (NG-1). Runs the same image under a different profile; the module is
+    # populated in Phase 1b. Present now so its memory is inside the NFR-11
+    # measurement rather than a surprise later.
+
+  nginx:
+    image: nginx@sha256:62223d644fa234c3a1cc785ee14242ec47a77364226f1c811d2f669f96dc2ac8
+    mem_limit: 32m
+    depends_on:
+      app-1: {condition: service_healthy}
+      app-2: {condition: service_healthy}
+    ports: ["8080:80"]
+    volumes:
+      - ./ops/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    healthcheck:
+      # 127.0.0.1, NOT localhost. nginx listens on 0.0.0.0:80 only, while
+      # `localhost` resolves to ::1 first inside the container - so the probe hit
+      # a closed IPv6 socket and reported "connection refused" while nginx was
+      # serving perfectly on IPv4.
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/nginx-health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # --- observability --------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus@sha256:da1630c5102817ed365a523448c766e417030a53ec3dfbe064d429df504e023e
+    mem_limit: 384m
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      # 6 h retention: long enough to inspect any run afterwards, short enough
+      # that the TSDB does not grow into the NFR-11 budget during a P4 soak.
+      - --storage.tsdb.retention.time=6h
+      - --storage.tsdb.path=/prometheus
+    ports: ["9090:9090"]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:9090/-/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  grafana:
+    image: grafana/grafana@sha256:58aeabeae706b990b3b1fc5ae8c97fd131921b2d6eb26a137ebaa91689d6ebfe
+    mem_limit: 256m
+    depends_on:
+      prometheus: {condition: service_healthy}
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: tatkal
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    ports: ["3000:3000"]
+    volumes:
+      # Dashboards are provisioned as code (AC-1.9). A dashboard that has to be
+      # rebuilt by hand does not exist.
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:3000/api/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  # --- chaos ----------------------------------------------------------------
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy@sha256:77286c8debaadbc57c94c69e24cbff177a802d90986c3c88655280270863ae2b
+    mem_limit: 32m
+    # Idle until Phase 2's chaos suite (C3 freezes Postgres for 5 s). Wired now
+    # so that adding chaos later does not require re-plumbing the stack.
+    ports:
+      - "8474:8474"
+      - "15432:15432"
+      - "16379:16379"
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+volumes:
+  pgdata:
+  promdata:

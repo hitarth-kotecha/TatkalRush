@@ -1,0 +1,16 @@
+# Provisioned as code (AC-1.9). A datasource clicked together in the UI is lost
+# the moment the volume is removed, and it cannot be reviewed in a diff.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      # Must match prometheus.yml's scrape_interval, or Grafana's auto step
+      # calculation smooths the 30-second P1 spike into something flatter than
+      # it was.
+      timeInterval: 5s
