@@ -1,0 +1,147 @@
+name: CI
+
+# Phase 0 CI: build the reactor, run every test, and enforce the two things that
+# fail silently if nobody checks them - stale image digests, and test classes
+# that surefire quietly skips.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          # Must be 25, not "latest" or 21. adapters/web is compiled with
+          # --enable-preview and preview classfiles refuse to load on any other
+          # JDK major (SDD 8.5, DD-003).
+          java-version: '25'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Report toolchain
+        # NFR-12 requires every published number to carry its JDK build. Printing
+        # it here means a CI log can always be matched to the bytecode it ran.
+        run: |
+          java -version
+          mvn -version
+
+      - name: Build and test
+        # Testcontainers needs a Docker daemon; ubuntu-latest runners have one.
+        # SchemaMigrationTest and SeedDeterminismTest both start real PostgreSQL
+        # 16 - H2 has no btree_gist, no INT4RANGE and no EXCLUDE, so an embedded
+        # substitute would skip the only things worth testing.
+        run: mvn -B clean verify
+
+      - name: Assert every test class actually ran
+        # The Phase 0 spike found surefire silently skipping property classes
+        # because *Properties matches none of its default include patterns. A
+        # green build that executed nothing is the worst possible outcome, so the
+        # count is asserted rather than trusted.
+        run: |
+          expected=6
+          actual=$(find . -path '*/target/surefire-reports/*.xml' -name 'TEST-*.xml' | wc -l)
+          echo "test classes executed: $actual (expected at least $expected)"
+          if [ "$actual" -lt "$expected" ]; then
+            echo "::error::Only $actual test classes ran; expected at least $expected."
+            echo "Surefire include patterns in the root POM are the usual cause."
+            find . -path '*/target/surefire-reports/*.xml' -name 'TEST-*.xml'
+            exit 1
+          fi
+
+      - name: Validate the decision log
+        # DOC-3, DOC-4, DOC-5. AC-0.5 and AC-1.12 both require every entry to
+        # carry at least two rejected alternatives and a falsifiable revisit
+        # condition. Thirty entries and rising is past the point where that can
+        # be checked by eye.
+        #
+        # What this cannot check is whether the reasoning is good - DOC-4 wants a
+        # SPECIFIC reason, not a vague one. That judgement stays with the
+        # reviewer; this catches missing sections and single-alternative entries.
+        run: python ops/docs/validate-decision-log.py docs/design-decisions.md
+
+      - name: Check pinned image digests are current
+        # Advisory. Digests are pinned deliberately and a drift is NOT an error -
+        # it means upstream published a new image, which is a decision to make
+        # and log (DD-003), not something to auto-apply.
+        continue-on-error: true
+        run: ./ops/docker/refresh-digests.sh --check
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: '**/target/surefire-reports/*.xml'
+          retention-days: 7
+
+  stack:
+    # AC-0.1: the stack comes up healthy within NFR-10's 120 s. Separate job so a
+    # unit-test failure and a stack failure are distinguishable at a glance.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start the stack and time it
+        run: |
+          start=$(date +%s)
+          docker compose up -d --wait --wait-timeout 180
+          end=$(date +%s)
+          elapsed=$((end - start))
+          echo "cold start: ${elapsed}s (NFR-10 budget: 120s)"
+          # Not failed on here: a GitHub runner is not the build machine, and
+          # NFR-12 requires numbers to carry their hardware. The gate that counts
+          # is AC-0.1 measured on the machine in docs/benchmarks/.
+          if [ "$elapsed" -gt 120 ]; then
+            echo "::warning::Cold start exceeded 120s on this runner (${elapsed}s)."
+          fi
+
+      - name: Verify migrations applied
+        # Flyway ran but silently did nothing once already, because Spring Boot 4
+        # moved FlywayAutoConfiguration out of spring-boot-autoconfigure. The app
+        # reported healthy against an empty database. Never again without a test.
+        run: |
+          tables=$(docker compose exec -T postgres psql -U tatkal -d tatkal -tAc \
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
+          echo "tables in public schema: $tables"
+          if [ "$tables" -lt 20 ]; then
+            echo "::error::Expected at least 20 tables, found $tables. Flyway did not run."
+            docker compose logs app-1 | tail -50
+            exit 1
+          fi
+
+      - name: Verify the exclusion constraint exists
+        run: |
+          docker compose exec -T postgres psql -U tatkal -d tatkal -tAc \
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint
+             WHERE conname = 'no_overlapping_allocations'" | grep -q 'EXCLUDE USING gist' \
+            || { echo "::error::no_overlapping_allocations is missing or altered"; exit 1; }
+
+      - name: Verify the app serves through nginx
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/actuator/health)
+          echo "nginx -> app: HTTP $code"
+          [ "$code" = "200" ] || { docker compose logs nginx app-1 | tail -40; exit 1; }
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 100
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
