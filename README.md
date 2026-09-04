@@ -171,7 +171,10 @@ is not built yet.**
 | Deterministic seed generator | ✅ built |
 | Correlation ID, structured logging, metrics | ✅ built |
 | CI: build, stack, decision-log validation | ✅ built |
-| **Segment-mask allocator, Strategy A** | Phase 1 |
+| Segment-mask allocator (`domain/inventory`) | ✅ built |
+| Strategy A: Redis-Lua atomic allocation | ✅ built |
+| Allocator contract suite, T-1 through T-4 | ✅ built |
+| T-7 differential equivalence (Java vs Lua) | ✅ built |
 | **Booking lifecycle, payment, PNR** | Phase 1 |
 | **Twelve invariant checks** | Phase 1 |
 | **Strategy B, chaos suite, comparison** | Phase 2 |
@@ -246,7 +249,7 @@ Requires Docker, JDK 25 and Maven.
 
 ```bash
 docker compose up -d --wait     # full stack, ~32 s
-mvn -B clean verify             # 156 tests, ~1.5 min (needs Docker for Testcontainers)
+mvn -B clean verify             # 159 tests, ~2 min (needs Docker for Testcontainers)
 ```
 
 The stack fits in 4.5 GB. On WSL2, copy [`ops/wsl/.wslconfig`](ops/wsl/.wslconfig)

@@ -34,6 +34,23 @@
 
   <build>
     <plugins>
+
+      <!--
+        Publishes src/test as a test-jar so differential/ can use PropertyRunner.
+        Copying it there instead would give T-4 and T-7 two shrinkers that could
+        drift apart - and T-7's whole value is that its minimal counterexample is
+        trustworthy.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>test-jar</id>
+            <goals><goal>test-jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-enforcer-plugin</artifactId>

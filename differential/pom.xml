@@ -36,6 +36,18 @@
       <artifactId>allocator-redis</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!--
+      PropertyRunner, shared with T-4 rather than copied. Two shrinkers that
+      could drift would undermine the one thing T-7 must be trusted on: that its
+      minimal counterexample really is minimal.
+    -->
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>domain</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>

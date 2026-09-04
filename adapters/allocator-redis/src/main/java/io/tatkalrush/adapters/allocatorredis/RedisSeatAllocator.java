@@ -210,6 +210,54 @@ public final class RedisSeatAllocator implements SeatAllocator {
         return new AvailabilitySnapshot(pool, range, free.intValue(), false);
     }
 
+    /**
+     * A pool's full mask and free-count state.
+     *
+     * @param masks occupancy per berth, indexed by pool ordinal
+     * @param freeCounts berths free per segment
+     */
+    public record PoolSnapshot(long[] masks, int[] freeCounts) {}
+
+    /**
+     * Reads the pool's entire state.
+     *
+     * <p>Not a convenience. §9.2 is explicit that a Lua bug returning the right
+     * <em>answer</em> via the wrong <em>state</em> — decrementing a free count by
+     * 1 instead of {@code passengerCount}, say — passes the contract suite and
+     * then silently corrupts availability for the rest of the run. T-7 compares
+     * this against the Java reference after every step for exactly that reason,
+     * and INV-8 and INV-12 check it post-run.
+     */
+    @SuppressWarnings("unchecked")
+    public PoolSnapshot snapshot(PoolKey pool) {
+        List<Object> reply =
+                scripts.run(
+                        "dump-state",
+                        ScriptOutputType.MULTI,
+                        new String[] {masksKey(pool), freeKey(pool)});
+
+        var rawMasks = (List<Object>) reply.get(0);
+        var rawFree = (List<Object>) reply.get(1);
+
+        // Two unsigned 32-bit halves back into one long. The high word carries
+        // segment 63 in its sign bit, so it must be shifted as an unsigned value
+        // before being OR-ed in - masking it into a long first is what stops sign
+        // extension from setting every bit above 63 (FR-3a).
+        var masks = new long[rawMasks.size() / 2];
+        for (int i = 0; i < masks.length; i++) {
+            long lo = (Long) rawMasks.get(i * 2) & 0xFFFF_FFFFL;
+            long hi = (Long) rawMasks.get(i * 2 + 1) & 0xFFFF_FFFFL;
+            masks[i] = (hi << 32) | lo;
+        }
+
+        var freeCounts = new int[rawFree.size()];
+        for (int i = 0; i < freeCounts.length; i++) {
+            freeCounts[i] = ((Long) rawFree.get(i)).intValue();
+        }
+
+        return new PoolSnapshot(masks, freeCounts);
+    }
+
     /** Reload count after a NOSCRIPT. Non-zero after a chaos run is expected. */
     public long scriptReloadCount() {
         return scripts.reloadCount();

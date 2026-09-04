@@ -147,6 +147,7 @@ end
 -- reclaims them. The background reaper (§13.2) exists only so idle pools release
 -- seats too; correctness does not depend on it running.
 
+local reaped_any = false
 local expired = redis.call('ZRANGEBYSCORE', holds_key, '-inf', now_ms)
 for i = 1, #expired do
   local dead_id = expired[i]
@@ -170,6 +171,7 @@ for i = 1, #expired do
     end
 
     redis.call('HDEL', detail_key, dead_id)
+    reaped_any = true
   end
   redis.call('ZREM', holds_key, dead_id)
 end
@@ -189,15 +191,43 @@ for ordinal = 0, berth_count - 1 do
   end
 end
 
+-- ------------------------------------------------------------- persistence
+
+local function persist()
+  local mask_parts = {}
+  for ordinal = 0, berth_count - 1 do
+    mask_parts[ordinal + 1] = struct.pack('<I4I4', mask_lo[ordinal], mask_hi[ordinal])
+  end
+  redis.call('SET', masks_key, table.concat(mask_parts))
+
+  local free_parts = {}
+  for seg = 0, segments - 1 do
+    free_parts[seg + 1] = struct.pack('<I4', free_counts[seg])
+  end
+  redis.call('SET', free_key, table.concat(free_parts))
+end
+
 -- --------------------------------------------------------- 3. all or nothing
 --
 -- FR-6. A partial allocation would leave berths held for a booking that failed -
--- the orphaned hold §1 claims this system does not produce. Note that the reaping
--- above has already been applied to the in-memory copies but NOT written back;
--- returning here discards it, which is safe because reaping is idempotent and the
--- next call redoes it.
+-- the orphaned hold §1 claims this system does not produce.
+--
+-- THE REAPING MUST BE PERSISTED EVEN ON THIS PATH. An earlier version returned
+-- here without writing back, on the reasoning that reaping is idempotent and the
+-- next allocation would redo it. T-7 disproved that in two operations: the Java
+-- reference persists its reap and returns UNAVAILABLE, so the two implementations
+-- ended a step with different masks and different free counts.
+--
+-- It is not merely an equivalence problem. Free counts feed availability (FR-13)
+-- and admission control's remaining_berths (FR-32), so seats reclaimed by a reap
+-- that is then thrown away stay invisible to search until some later allocation
+-- happens to reap them again -- understating availability for an unbounded time,
+-- with nothing reporting it.
 
 if #chosen < passengers then
+  if reaped_any then
+    persist()
+  end
   return { 'UNAVAILABLE', #chosen }
 end
 
@@ -215,17 +245,7 @@ end
 
 -- ------------------------------------------------------- 5. persist state
 
-local mask_parts = {}
-for ordinal = 0, berth_count - 1 do
-  mask_parts[ordinal + 1] = struct.pack('<I4I4', mask_lo[ordinal], mask_hi[ordinal])
-end
-redis.call('SET', masks_key, table.concat(mask_parts))
-
-local free_parts = {}
-for seg = 0, segments - 1 do
-  free_parts[seg + 1] = struct.pack('<I4', free_counts[seg])
-end
-redis.call('SET', free_key, table.concat(free_parts))
+persist()
 
 redis.call('ZADD', holds_key, now_ms + ttl_ms, hold_id)
 redis.call('HSET', detail_key, hold_id,
