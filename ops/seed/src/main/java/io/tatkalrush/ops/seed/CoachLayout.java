@@ -1,5 +1,6 @@
 package io.tatkalrush.ops.seed;
 
+import io.tatkalrush.domain.inventory.TravelClass;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -60,13 +61,21 @@ public enum CoachLayout {
         return List.copyOf(pattern);
     }
 
-    /** The database code for this class, matching the CHECK constraints in V2/V3. */
-    public String travelClass() {
+    /**
+     * The domain travel class this layout describes.
+     *
+     * <p>Delegated rather than redefined. This enum previously carried its own
+     * copy of the codes ("SL", "3A", ...), which made two sources of truth for a
+     * value that also appears in the V2 and V3 CHECK constraints. A mismatch
+     * between them is an insert failure at runtime, not a compile error, so the
+     * duplication was worth removing the moment a domain enum existed.
+     */
+    public TravelClass travelClass() {
         return switch (this) {
-            case SL -> "SL";
-            case THREE_A -> "3A";
-            case TWO_A -> "2A";
-            case ONE_A -> "1A";
+            case SL -> TravelClass.SL;
+            case THREE_A -> TravelClass.AC3;
+            case TWO_A -> TravelClass.AC2;
+            case ONE_A -> TravelClass.AC1;
         };
     }
 

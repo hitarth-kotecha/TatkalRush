@@ -74,7 +74,7 @@ class CoachLayoutTest {
     @DisplayName("every class maps to a travel_class the schema's CHECK accepts")
     void travelClassMatchesSchema(CoachLayout layout) {
         assertTrue(
-                Set.of("SL", "3A", "2A", "1A", "CC").contains(layout.travelClass()),
-                layout + " maps to " + layout.travelClass() + ", which V2's CHECK would reject");
+                Set.of("SL", "3A", "2A", "1A", "CC").contains(layout.travelClass().code()),
+                layout + " maps to " + layout.travelClass().code() + ", which V2's CHECK would reject");
     }
 }

@@ -27,4 +27,28 @@
     </dependency>
   </dependencies>
 
+  <!--
+    Publishes src/test as a test-jar so adapters/allocator-redis and
+    adapters/allocator-swp can extend SeatAllocatorContract directly.
+
+    AC-2.1 requires Strategy B to pass the IDENTICAL suite with no test
+    modifications. Copying the suite into each adapter would let the copies drift,
+    and a drifted "identical" suite is worse than none: it still reports green.
+    Sharing the compiled class makes drift impossible rather than discouraged.
+  -->
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>test-jar</id>
+            <goals><goal>test-jar</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>
+

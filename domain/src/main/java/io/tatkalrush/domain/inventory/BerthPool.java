@@ -165,6 +165,30 @@ public final class BerthPool {
     }
 
     /**
+     * Promotes a hold into a permanent allocation: the berths stay occupied, but
+     * the expiry clock stops.
+     *
+     * <p>Distinct from {@link #release} in exactly the way that matters. Release
+     * frees the berths; confirm keeps them and removes the hold from the reaper's
+     * reach. Without this a confirmed booking's berths would be swept the moment
+     * its original TTL passed, releasing seats a passenger has paid for — and
+     * INV-4 would find the orphan long after the customer did.
+     *
+     * @return whether a live hold was found and confirmed. {@code false} means it
+     *     had already expired, which FR-24 treats as benign rather than as an
+     *     error: the caller auto-refunds with reason {@code HOLD_EXPIRED}.
+     */
+    public boolean confirm(String holdId) {
+        return holds.remove(holdId) != null;
+    }
+
+    /** Berth ordinals a live hold occupies, or empty if it is gone. */
+    public List<Integer> berthsOf(String holdId) {
+        Hold hold = holds.get(holdId);
+        return hold == null ? List.of() : hold.berthOrdinals();
+    }
+
+    /**
      * Sweeps holds whose TTL has passed (§9.2).
      *
      * <p>Called automatically at the start of every {@link #allocate}, and

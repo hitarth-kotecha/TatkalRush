@@ -305,11 +305,11 @@ public final class SeedGenerator {
 
                 for (CoachLayout layout : train.coaches()) {
                     coachId++;
-                    int n = perClassIndex.merge(layout.travelClass(), 1, Integer::sum);
+                    int n = perClassIndex.merge(layout.travelClass().code(), 1, Integer::sum);
 
                     coachPs.setLong(1, train.id());
-                    coachPs.setString(2, layout.travelClass() + n);
-                    coachPs.setString(3, layout.travelClass());
+                    coachPs.setString(2, layout.travelClass().code() + n);
+                    coachPs.setString(3, layout.travelClass().code());
                     coachPs.setInt(4, layout.berthCount());
                     coachPs.addBatch();
                     stats.coaches++;
@@ -476,7 +476,7 @@ public final class SeedGenerator {
 
         long berthId = train.firstBerthId();
         for (CoachLayout layout : train.coaches()) {
-            var list = byClass.computeIfAbsent(layout.travelClass(), k -> new ArrayList<>());
+            var list = byClass.computeIfAbsent(layout.travelClass().code(), k -> new ArrayList<>());
             for (int i = 0; i < layout.berthCount(); i++) {
                 list.add(berthId++);
             }
