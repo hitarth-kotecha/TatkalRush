@@ -186,7 +186,7 @@ is not built yet.**
 | Deterministic seed | **21.3 s** (budget 60 s), 291,120 bookable berths |
 | Schema + exclusion constraint | 20 tables; overlap rejected, complementary legs both allocated |
 | Boundary enforcement | verified by deliberate violation — compile error *and* enforcer |
-| Decision log | 29 entries, validated in CI |
+| Decision log | 30 entries, validated in CI |
 | Toolchain spike | passed |
 | Memory | **1,565 MiB** of a 4,608 MiB budget (34 %) |
 
@@ -246,7 +246,7 @@ Requires Docker, JDK 25 and Maven.
 
 ```bash
 docker compose up -d --wait     # full stack, ~32 s
-mvn -B clean verify             # 43 tests, ~2 min (needs Docker for Testcontainers)
+mvn -B clean verify             # 68 tests, ~1.5 min (needs Docker for Testcontainers)
 ```
 
 The stack fits in 4.5 GB. On WSL2, copy [`ops/wsl/.wslconfig`](ops/wsl/.wslconfig)
@@ -270,7 +270,7 @@ Reproduce the calibration:
 
 ## Why the decision log matters
 
-[`docs/design-decisions.md`](docs/design-decisions.md) is 29 entries and counting.
+[`docs/design-decisions.md`](docs/design-decisions.md) is 30 entries and counting.
 Every one carries the problem, the decision, **at least two rejected alternatives
 with specific reasons**, the consequences including what got worse, and a named,
 observable condition that would reverse it. A decision you cannot falsify was not

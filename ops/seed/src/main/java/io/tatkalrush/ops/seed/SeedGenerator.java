@@ -48,12 +48,34 @@ public final class SeedGenerator {
     private static final ZoneOffset IST = ZoneOffset.ofHoursMinutes(5, 30);
 
     /**
-     * Share of each class's berths carved out for TATKAL. A berth belongs to
-     * exactly ONE pool: GENERAL and TATKAL sell disjoint sets, because a berth
-     * present in both could be sold twice through two quotas while each pool's
-     * own mask stayed perfectly consistent (FR-10).
+     * FR-9: the TATKAL pool is {@code ceil(0.10 x class_capacity)}, minimum 1
+     * berth. This is a REQUIREMENT, not a tuning parameter - Phase 0 shipped it
+     * as a rounded 0.20 and recorded that in DD-026 as though it were a choice,
+     * which it never was (superseded by DD-030).
+     *
+     * <p>It matters beyond correctness-by-the-book: the TATKAL pool is exactly
+     * what P1's spike contends over, so doubling it halves the contention §9.4
+     * exists to measure.
+     *
+     * <p>A berth belongs to exactly ONE pool. GENERAL and TATKAL sell disjoint
+     * sets, because a berth present in both could be sold twice through two
+     * quotas while each pool's own mask stayed perfectly consistent (FR-10).
      */
-    private static final double TATKAL_SHARE = 0.20;
+    private static final double TATKAL_SHARE = 0.10;
+
+    /**
+     * FR-9's TATKAL pool size: {@code ceil(0.10 x capacity)}, never below 1.
+     *
+     * <p>{@code ceil}, not {@code round}: a 4-berth class rounds to 0 and would
+     * have no Tatkal inventory at all, which is a silent hole rather than a
+     * rounding difference. The floor of 1 covers the same case explicitly.
+     */
+    static int tatkalPoolSize(int capacity) {
+        if (capacity <= 0) {
+            return 0;
+        }
+        return Math.max(1, (int) Math.ceil(capacity * TATKAL_SHARE));
+    }
 
     private static final int BATCH = 5_000;
 
@@ -391,7 +413,7 @@ public final class SeedGenerator {
 
                     for (var entry : berthsByClass.entrySet()) {
                         List<Long> berthIds = entry.getValue();
-                        int tatkalCount = (int) Math.round(berthIds.size() * TATKAL_SHARE);
+                        int tatkalCount = tatkalPoolSize(berthIds.size());
                         int generalCount = berthIds.size() - tatkalCount;
 
                         long generalPoolId = ++poolId;

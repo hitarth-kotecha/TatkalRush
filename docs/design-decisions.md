@@ -60,6 +60,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-027](#dd-027) | Seed insertion: batch rewriting, explicit timestamps, FK-ordered flushing | 0 |
 | [DD-028](#dd-028) | Correlation id lives in a ScopedValue, and also in the MDC | 0 |
 | [DD-029](#dd-029) | AC-0.7's threshold is replaced by a derived floor; OQ-2 closes | 0 |
+| [DD-030](#dd-030) | TATKAL pool size is FR-9's, not a number I chose | 0 |
 
 ---
 
@@ -1580,6 +1581,96 @@ A precedent has been set that a threshold may be revised. It is bounded by the r
 
 - **AC-1.13 is the checkpoint.** If measured `hold` throughput is below ~40 rps, or if P3 run against both strategies produces p99 distributions that **overlap within noise**, contention was insufficient regardless of what this calibration reported. OQ-2 reopens at that point with the measured distributions attached, and alternative 2 becomes the likely answer.
 - If any future threshold is proposed without a derivation, this entry is the precedent for refusing it.
+
+---
+
+<a id="dd-030"></a>
+### DD-030 — TATKAL pool size is FR-9's, not a number I chose
+
+Date: 2026-09-04 · Author: Phase 1a start · Phase: 0 · Requirements: FR-9, FR-8, AC-0.2
+Supersedes: the TATKAL share in [DD-026](#dd-026), item 4
+
+**Context.**
+
+DD-026 records, as decision item 4: *"TATKAL takes 20 % of each class's berths."*
+It cites FR-8 and FR-10 for pool disjointness and says nothing about where 20 %
+came from — because it came from nowhere. It was picked while writing the seed
+generator and then written up as though it had been reasoned about.
+
+**FR-9 already specified it:** `TATKAL` pool size is `ceil(0.10 × class_capacity)`,
+minimum 1 berth.
+
+Three errors in one line, none of which anything caught:
+
+| | Shipped | FR-9 |
+|---|---|---|
+| Share | `0.20` | `0.10` |
+| Rounding | `Math.round` | `ceil` |
+| Floor | none | minimum 1 berth |
+
+Every Phase 0 assertion passed. The pools were disjoint, `pool_berths` totalled
+291,120, GENERAL and TATKAL summed to capacity. Nothing in the schema, the tests
+or the invariants had any opinion about the *ratio*, so a doubled Tatkal quota
+looked exactly like a correct one.
+
+**Why it is not cosmetic.** The TATKAL pool is precisely what P1 — the Tatkal
+spike, the project's headline scenario — contends over. A pool of twice the
+mandated size means roughly half the contention, and contention is the entire
+phenomenon §9.4 sets out to measure. A benchmark run against 20 % would have
+produced real numbers describing the wrong system, and nothing in the report
+would have flagged it.
+
+`Math.round` compounds it at the small end: `round(4 × 0.10)` is 0. A class with
+no Tatkal inventory returns `SEAT_UNAVAILABLE` for every Tatkal request, and
+FR-51 *excludes* `SEAT_UNAVAILABLE` from the error budget — so the hole would not
+even register as a failure.
+
+**Decision.**
+
+1. `TATKAL_SHARE` is **0.10**, applied as `max(1, ceil(capacity × 0.10))` in
+   `SeedGenerator.tatkalPoolSize`.
+2. **`TatkalPoolSizeTest`** pins FR-9 at the unit level, including the
+   round-to-zero case and a named test asserting ten percent rather than twenty,
+   so a regression fails with a message citing the requirement.
+3. **`SeedDeterminismTest.tatkalPoolsMatchFr9`** asserts the rule survived into
+   the database across all 3,600 pools, and separately that no TATKAL pool
+   exceeds its GENERAL counterpart.
+4. DD-026 stands unedited. This entry supersedes its item 4 (DOC-8).
+
+**Alternatives considered.**
+
+1. **Edit DD-026 in place and move on.** Rejected: DOC-1 makes the log
+   append-only and DOC-8 requires superseding entries precisely so reversals stay
+   visible. A tidied log loses the most useful information it holds — that a
+   requirement was overwritten by an invented number, and what let that through.
+
+2. **Keep 20 % and amend FR-9 to match**, on the grounds that a larger Tatkal
+   pool gives a more interesting spike. Rejected on two counts. It inverts the
+   direction of authority: §0 says agents must not invent requirements, and
+   retro-fitting the spec to the code is that failure with extra steps. And it is
+   backwards on the merits — a *smaller* pool is the harder, more interesting
+   contention case, which is presumably why FR-9 says 10 %.
+
+**Consequences.**
+
+The dataset's total size is unchanged at 291,120 bookable berth-instances; only
+the GENERAL/TATKAL split moves. Every AC-0.2 assertion still holds, which is
+itself the finding: those assertions were never going to catch this.
+
+P1 will now contend over roughly half the inventory it would have, which is the
+correct and more demanding scenario.
+
+The general lesson is cheaper to learn here than in Phase 2: **a decision-log
+entry is not evidence that a decision was needed.** DD-026 documented a choice
+where the SDD had already made one. Before recording a decision, check whether
+the requirement already answers it — the log's value depends on its entries being
+about genuinely open questions.
+
+**What would change this.**
+
+FR-9 changing. Nothing else — this is a requirement, not a tuning parameter, and
+if a future measurement suggests a different Tatkal share, that is an argument to
+amend FR-9 deliberately and record the amendment, not to drift the constant.
 
 ---
 

@@ -217,6 +217,40 @@ class SeedDeterminismTest {
     // --------------------------------------------------- re-seeding, ordered last
 
     @Test
+    @Order(6)
+    @DisplayName("FR-9: every TATKAL pool is ceil(0.10 x capacity), minimum 1")
+    void tatkalPoolsMatchFr9() throws SQLException {
+        // The unit-level check lives in TatkalPoolSizeTest; this one asserts the
+        // rule survived the round trip into the database, across all 3,600 pools.
+        assertEquals(
+                0,
+                queryInt(
+                        "SELECT count(*) FROM ("
+                            + "  SELECT qp.schedule_id, qp.travel_class,"
+                            + "         sum(CASE WHEN qp.quota_type='TATKAL' THEN qp.total_berths"
+                            + "                  ELSE 0 END) AS tatkal,"
+                            + "         sum(qp.total_berths) AS capacity"
+                            + "  FROM quota_pools qp"
+                            + "  GROUP BY qp.schedule_id, qp.travel_class) t"
+                            + " WHERE tatkal <> GREATEST(1, CEIL(capacity * 0.10))"),
+                "a TATKAL pool does not satisfy FR-9's ceil(0.10 x capacity), minimum 1."
+                        + " Phase 0 shipped 0.20 here; see DD-030.");
+
+        // Guards the direction the bug actually took: an oversized TATKAL pool
+        // halves the contention P1 exists to create, and nothing else would
+        // report it as wrong.
+        assertEquals(
+                0,
+                queryInt(
+                        "SELECT count(*) FROM quota_pools qp1"
+                            + " JOIN quota_pools qp2 ON qp1.schedule_id = qp2.schedule_id"
+                            + "   AND qp1.travel_class = qp2.travel_class"
+                            + " WHERE qp1.quota_type = 'TATKAL' AND qp2.quota_type = 'GENERAL'"
+                            + "   AND qp1.total_berths > qp2.total_berths"),
+                "a TATKAL pool is larger than its GENERAL counterpart; FR-9 caps it at 10%");
+    }
+
+    @Test
     @Order(90)
     @DisplayName("AC-0.2 / FR-50: the same seed produces byte-identical data")
     void seedingIsDeterministic() throws SQLException {
