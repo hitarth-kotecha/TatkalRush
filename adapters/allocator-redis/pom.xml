@@ -34,6 +34,37 @@
       <artifactId>spring-boot-starter-test</artifactId>
       <scope>test</scope>
     </dependency>
+
+    <!--
+      The contract suite from application's test-jar. Extended, never copied:
+      AC-2.1 requires Strategy B to pass the IDENTICAL suite, and two copies
+      would drift while both still reported green.
+    -->
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>application</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      A real Redis, not a fake. The whole of Strategy A's correctness rests on
+      Redis executing Lua single-threaded and on Lua 5.1's `bit` library
+      behaving exactly as FR-3a describes; an in-memory stand-in would verify
+      neither. No testcontainers-redis module exists in the 2.x BOM, so this
+      uses GenericContainer with the same image digest compose.yaml pins.
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
 </project>

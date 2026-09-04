@@ -52,7 +52,7 @@ jobs:
         # green build that executed nothing is the worst possible outcome, so the
         # count is asserted rather than trusted.
         run: |
-          expected=12
+          expected=13
           actual=$(find . -path '*/target/surefire-reports/*.xml' -name 'TEST-*.xml' | wc -l)
           echo "test classes executed: $actual (expected at least $expected)"
           if [ "$actual" -lt "$expected" ]; then
