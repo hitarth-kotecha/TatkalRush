@@ -1,0 +1,69 @@
+spring:
+  application:
+    name: tatkal-rush
+  threads:
+    # Final since Java 21. Load-bearing for Strategy B, where an HTTP handler
+    # blocks awaiting a reply from a partition owner over Kafka: with platform
+    # threads, thousands of concurrent blocked handlers would exhaust the pool
+    # (SDD 8.5).
+    virtual:
+      enabled: true
+
+  flyway:
+    enabled: true
+    # Migrations live in adapters/persistence, which app/ depends on, so they
+    # arrive on the classpath rather than being duplicated here.
+    locations: classpath:db/migration
+    # Fail rather than adapt if the database already has objects Flyway did not
+    # create. A baseline-on-migrate would silently accept a hand-modified
+    # database and make "the schema is what the migrations say" untrue - which
+    # is the assumption every invariant check rests on.
+    baseline-on-migrate: false
+    validate-on-migrate: true
+
+  datasource:
+    hikari:
+      # Sized against Postgres's max_connections=120 (compose.yaml) across two
+      # app replicas plus psp-sim: 3 x 30 = 90, leaving headroom for the seed
+      # generator, the invariant checker and a psql session during a run.
+      # Recorded per DOC-2; revisit if connection acquisition shows up in
+      # NFR-3's latency budget.
+      maximum-pool-size: 30
+      minimum-idle: 5
+      connection-timeout: 3000
+
+server:
+  port: 8080
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # API-11. Prometheus scrapes /actuator/prometheus (SDD 15.1).
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+  metrics:
+    tags:
+      application: tatkal-rush
+
+logging:
+  level:
+    root: INFO
+    # Verbose logging changes the benchmark and must not be enabled during load
+    # runs (SDD 15.3). If a P1 run needs DEBUG to explain something, that is a
+    # separate diagnostic run and its numbers do not go in docs/benchmarks/.
+    io.tatkalrush: INFO
+
+  structured:
+    format:
+      # Structured JSON, not a human-readable pattern (SDD 15.3). The correlation
+      # id set by CorrelationIdFilter arrives as an MDC field, so every line of a
+      # request's trace can be selected with a single grep - which is the whole
+      # point once Strategy B spreads one booking across an HTTP handler, a Kafka
+      # command topic, a partition owner on another replica, and a reply topic.
+      console: ecs
