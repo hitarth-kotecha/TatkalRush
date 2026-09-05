@@ -13,6 +13,7 @@ import io.tatkalrush.application.ports.UnitOfWork;
 import io.tatkalrush.application.usecases.HoldSeats.HoldSeatsCommand;
 import io.tatkalrush.application.usecases.HoldSeats.Result;
 import io.tatkalrush.domain.booking.BookingStatus;
+import io.tatkalrush.domain.booking.Passenger;
 import io.tatkalrush.domain.inventory.PoolKey;
 import io.tatkalrush.domain.inventory.QuotaType;
 import io.tatkalrush.domain.inventory.SegmentRange;
@@ -72,9 +73,18 @@ class HoldSeatsTest {
                         TTL, 3);
     }
 
+    /** Synthetic travellers, per FR-62. Names are the only personal data here. */
+    private static List<Passenger> travellers(int count) {
+        var list = new ArrayList<Passenger>();
+        for (int i = 0; i < count; i++) {
+            list.add(new Passenger("Passenger " + (i + 1), 30 + i, Passenger.Gender.O));
+        }
+        return list;
+    }
+
     private HoldSeatsCommand command(String key, int passengers) {
         return new HoldSeatsCommand(
-                pool, SegmentRange.of(0, 4), passengers, 7L, key, "hash-" + key, NOW);
+                pool, SegmentRange.of(0, 4), travellers(passengers), 7L, key, "hash-" + key, NOW);
     }
 
     // ------------------------------------------------------------- happy path
@@ -99,6 +109,39 @@ class HoldSeatsTest {
             assertEquals(BookingStatus.HELD, stored.status());
             assertEquals(Optional.empty(), stored.pnr(), "§6.4 issues the PNR at confirmation");
             assertEquals(held.farePaise(), stored.farePaise());
+        }
+
+        @Test
+        @DisplayName("each passenger is paired with a berth, in order")
+        void passengersReachTheRepositoryPairedWithBerths() {
+            var held = assertInstanceOf(Result.Held.class, holdSeats.handle(command("k1", 3)));
+
+            var stored = bookings.lastCreated();
+            assertEquals(3, stored.passengerCount(), "derived from the list, not carried");
+            assertEquals(held.berthIds(), stored.berthIds());
+            assertEquals(
+                    List.of("Passenger 1", "Passenger 2", "Passenger 3"),
+                    stored.passengers().stream().map(Passenger::name).toList());
+        }
+
+        @Test
+        @DisplayName("passengers and berths must be the same length (FR-6)")
+        void mismatchedBerthsAreRefused() {
+            var thrown =
+                    assertThrows(
+                            IllegalArgumentException.class,
+                            () ->
+                                    new BookingRepository.NewHeldBooking(
+                                            pool,
+                                            SegmentRange.of(0, 4),
+                                            travellers(3),
+                                            1000L,
+                                            7L,
+                                            NOW,
+                                            "k",
+                                            List.of(1L, 2L)));
+
+            assertTrue(thrown.getMessage().contains("FR-6"), thrown.getMessage());
         }
 
         @Test
@@ -158,7 +201,13 @@ class HoldSeatsTest {
 
             var different =
                     new HoldSeatsCommand(
-                            pool, SegmentRange.of(0, 2), 1, 7L, "k1", "a-different-hash", NOW);
+                            pool,
+                            SegmentRange.of(0, 2),
+                            travellers(1),
+                            7L,
+                            "k1",
+                            "a-different-hash",
+                            NOW);
 
             assertInstanceOf(Result.IdempotencyKeyReused.class, holdSeats.handle(different));
         }
@@ -181,7 +230,13 @@ class HoldSeatsTest {
                     IllegalArgumentException.class,
                     () ->
                             new HoldSeatsCommand(
-                                    pool, SegmentRange.of(0, 4), 1, 7L, "  ", "hash", NOW));
+                                    pool,
+                                    SegmentRange.of(0, 4),
+                                    travellers(1),
+                                    7L,
+                                    "  ",
+                                    "hash",
+                                    NOW));
         }
     }
 
@@ -198,7 +253,7 @@ class HoldSeatsTest {
                     new HoldSeatsCommand(
                             pool,
                             SegmentRange.of(0, 4),
-                            1,
+                            travellers(1),
                             7L,
                             "k1",
                             "hash",
@@ -218,7 +273,7 @@ class HoldSeatsTest {
         void lockedPoolLeavesKeyUnclaimed() {
             var beforeWindow =
                     new HoldSeatsCommand(
-                            pool, SegmentRange.of(0, 4), 1, 7L, "k1", "hash",
+                            pool, SegmentRange.of(0, 4), travellers(1), 7L, "k1", "hash",
                             TATKAL_OPEN.minusSeconds(1));
             holdSeats.handle(beforeWindow);
 
@@ -238,14 +293,14 @@ class HoldSeatsTest {
 
             var longBefore =
                     new HoldSeatsCommand(
-                            pool, SegmentRange.of(0, 4), 1, 7L, "k", "h",
+                            pool, SegmentRange.of(0, 4), travellers(1), 7L, "k", "h",
                             TATKAL_OPEN.minusSeconds(86_400));
 
             assertInstanceOf(
                     Result.Held.class,
                     holdSeats.handle(
                             new HoldSeatsCommand(
-                                    general, longBefore.range(), 1, 7L, "kg", "hg",
+                                    general, longBefore.range(), travellers(1), 7L, "kg", "hg",
                                     longBefore.now())));
         }
 
@@ -293,7 +348,7 @@ class HoldSeatsTest {
         void rangeBeyondRoute() {
             var tooLong =
                     new HoldSeatsCommand(
-                            pool, SegmentRange.of(0, 8), 1, 7L, "k1", "hash", NOW);
+                            pool, SegmentRange.of(0, 8), travellers(1), 7L, "k1", "hash", NOW);
             assertInstanceOf(Result.InvalidRange.class, holdSeats.handle(tooLong));
         }
 
@@ -304,7 +359,7 @@ class HoldSeatsTest {
             var result =
                     holdSeats.handle(
                             new HoldSeatsCommand(
-                                    missing, SegmentRange.of(0, 2), 1, 7L, "k", "h", NOW));
+                                    missing, SegmentRange.of(0, 2), travellers(1), 7L, "k", "h", NOW));
             assertInstanceOf(Result.UnknownPool.class, result);
         }
     }
@@ -428,6 +483,7 @@ class HoldSeatsTest {
         private final AtomicLong nextId = new AtomicLong(1);
         private int activeHolds;
         private boolean failNext;
+        private NewHeldBooking lastCreated;
 
         void setActiveHolds(int count) {
             this.activeHolds = count;
@@ -447,8 +503,13 @@ class HoldSeatsTest {
                             existing.userId(), existing.holdExpiresAt(), existing.berthIds()));
         }
 
+        NewHeldBooking lastCreated() {
+            return lastCreated;
+        }
+
         @Override
         public long createHeld(NewHeldBooking booking) {
+            lastCreated = booking;
             if (failNext) {
                 failNext = false;
                 throw new IllegalStateException("simulated insert failure");

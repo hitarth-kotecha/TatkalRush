@@ -7,6 +7,7 @@ import io.tatkalrush.application.ports.IdempotencyStore;
 import io.tatkalrush.application.ports.ScheduleQuery;
 import io.tatkalrush.application.ports.SeatAllocator;
 import io.tatkalrush.application.ports.UnitOfWork;
+import io.tatkalrush.domain.booking.Passenger;
 import io.tatkalrush.domain.inventory.QuotaType;
 import io.tatkalrush.domain.inventory.SegmentRange;
 import io.tatkalrush.domain.inventory.TatkalWindow;
@@ -181,7 +182,7 @@ public final class HoldSeats {
                             new BookingRepository.NewHeldBooking(
                                     command.pool(),
                                     command.range(),
-                                    command.passengerCount(),
+                                    command.passengers(),
                                     farePaise,
                                     command.userId(),
                                     allocated.expiresAt(),
@@ -259,13 +260,14 @@ public final class HoldSeats {
     public record HoldSeatsCommand(
             io.tatkalrush.domain.inventory.PoolKey pool,
             SegmentRange range,
-            int passengerCount,
+            java.util.List<Passenger> passengers,
             long userId,
             String idempotencyKey,
             String requestHash,
             Instant now) {
 
         public HoldSeatsCommand {
+            passengers = java.util.List.copyOf(passengers);
             if (idempotencyKey == null || idempotencyKey.isBlank()) {
                 // FR-19 makes the header mandatory. Generating one server-side
                 // would defeat the point: the client's retry would carry a
@@ -275,10 +277,21 @@ public final class HoldSeats {
             if (pool.quotaType() == null) {
                 throw new IllegalArgumentException("quotaType is required");
             }
-            if (passengerCount < 1 || passengerCount > 6) {
+            if (passengers.isEmpty() || passengers.size() > 6) {
                 throw new IllegalArgumentException(
-                        "passengerCount must be 1..6, got " + passengerCount);
+                        "a booking carries 1..6 passengers, got " + passengers.size());
             }
+        }
+
+        /**
+         * Derived from {@link #passengers()}, never carried alongside it.
+         *
+         * <p>Two fields that must agree are two chances to disagree, and the
+         * {@code passenger_count} CHECK would report that disagreement as a
+         * constraint failure rather than as the modelling error it is.
+         */
+        public int passengerCount() {
+            return passengers.size();
         }
 
         public boolean isTatkal() {

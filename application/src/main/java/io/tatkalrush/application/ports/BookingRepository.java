@@ -1,6 +1,7 @@
 package io.tatkalrush.application.ports;
 
 import io.tatkalrush.domain.booking.BookingStatus;
+import io.tatkalrush.domain.booking.Passenger;
 import io.tatkalrush.domain.inventory.PoolKey;
 import io.tatkalrush.domain.inventory.SegmentRange;
 import java.time.Instant;
@@ -29,16 +30,41 @@ public interface BookingRepository {
             Optional<Instant> holdExpiresAt,
             List<Long> berthIds) {}
 
-    /** A new booking in {@link BookingStatus#HELD}. */
+    /**
+     * A new booking in {@link BookingStatus#HELD}.
+     *
+     * @param passengers one per berth, in the same order. {@code passengers.berth_id}
+     *     is the only column where a held berth can live, so a booking cannot be
+     *     stored without them — which is why they are here rather than a separate
+     *     later write.
+     * @param berthIds must be the same length as {@code passengers}; berth
+     *     {@code i} is assigned to passenger {@code i}
+     */
     record NewHeldBooking(
             PoolKey pool,
             SegmentRange range,
-            int passengerCount,
+            List<Passenger> passengers,
             long farePaise,
             long userId,
             Instant holdExpiresAt,
             String idempotencyKey,
-            List<Long> berthIds) {}
+            List<Long> berthIds) {
+
+        public NewHeldBooking {
+            passengers = List.copyOf(passengers);
+            berthIds = List.copyOf(berthIds);
+            if (passengers.size() != berthIds.size()) {
+                throw new IllegalArgumentException(
+                        "%d passengers but %d berths — FR-6 allocates all or nothing"
+                                .formatted(passengers.size(), berthIds.size()));
+            }
+        }
+
+        /** Derived, never stored twice. */
+        public int passengerCount() {
+            return passengers.size();
+        }
+    }
 
     /** Inserts a held booking and returns its id. */
     long createHeld(NewHeldBooking booking);
