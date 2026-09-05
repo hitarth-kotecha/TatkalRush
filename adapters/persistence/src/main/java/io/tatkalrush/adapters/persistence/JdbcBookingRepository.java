@@ -132,6 +132,31 @@ public final class JdbcBookingRepository implements BookingRepository {
     }
 
     @Override
+    public Optional<BookingView> findByPnr(String pnr) {
+        return jdbc.sql(SELECT_BOOKING.replace("WHERE id = ?", "WHERE pnr = ?"))
+                .param(pnr)
+                .query(this::toView)
+                .optional();
+    }
+
+    @Override
+    public Optional<String> holdIdOf(long bookingId) {
+        return jdbc.sql("SELECT idempotency_key FROM bookings WHERE id = ?")
+                .param(bookingId)
+                .query(String.class)
+                .optional();
+    }
+
+    @Override
+    public int deleteAllocations(long bookingId) {
+        // §13.4 rebuilds Redis masks from these rows. Leaving them behind on a
+        // cancellation would have the next rebuild re-occupy the freed berth.
+        return jdbc.sql("DELETE FROM seat_allocations WHERE booking_id = ?")
+                .param(bookingId)
+                .update();
+    }
+
+    @Override
     public int countActiveHolds(long userId, Instant now) {
         return jdbc.sql(
                         """
@@ -327,6 +352,26 @@ public final class JdbcBookingRepository implements BookingRepository {
     @Override
     public boolean markFailed(long bookingId, Instant at) {
         return transition(bookingId, BookingStatus.PAYMENT_PENDING, BookingStatus.FAILED);
+    }
+
+    @Override
+    public boolean cancel(long bookingId, Instant at) {
+        int updated =
+                jdbc.sql(
+                                """
+                                UPDATE bookings
+                                SET status = 'CANCELLED', cancelled_at = ?
+                                WHERE id = ? AND status = 'CONFIRMED'
+                                """)
+                        .param(Timestamp.from(at))
+                        .param(bookingId)
+                        .update();
+        return updated == 1;
+    }
+
+    @Override
+    public boolean releaseHold(long bookingId, Instant at) {
+        return transition(bookingId, BookingStatus.HELD, BookingStatus.EXPIRED);
     }
 
     @Override

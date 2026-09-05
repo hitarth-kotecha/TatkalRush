@@ -26,6 +26,7 @@ import io.tatkalrush.application.ports.PnrSequence;
 import io.tatkalrush.application.ports.ScheduleQuery;
 import io.tatkalrush.application.ports.SeatAllocator;
 import io.tatkalrush.application.ports.UnitOfWork;
+import io.tatkalrush.application.usecases.CancelBooking;
 import io.tatkalrush.application.usecases.ConfirmBooking;
 import io.tatkalrush.application.usecases.HoldSeats;
 import io.tatkalrush.application.usecases.InitiatePayment;
@@ -224,6 +225,17 @@ public class ApplicationWiring {
             PaymentReferences references,
             UnitOfWork unitOfWork) {
         return new InitiatePayment(bookings, payments, gateway, references, unitOfWork);
+    }
+
+    @Bean
+    CancelBooking cancelBooking(
+            BookingRepository bookings,
+            PaymentRepository payments,
+            PaymentGateway gateway,
+            SeatAllocator allocator,
+            ScheduleQuery schedules,
+            UnitOfWork unitOfWork) {
+        return new CancelBooking(bookings, payments, gateway, allocator, schedules, unitOfWork);
     }
 
     @Bean

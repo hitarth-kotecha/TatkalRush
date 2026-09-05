@@ -652,6 +652,35 @@ class PaymentPathTest {
             return true;
         }
 
+
+        // Cancellation (FR-43). Not reachable from this use case; unimplemented
+        // rather than faked, so a dependency appearing here is noticed.
+
+        @Override
+        public Optional<BookingView> findByPnr(String pnr) {
+            throw new UnsupportedOperationException("not part of this path");
+        }
+
+        @Override
+        public Optional<String> holdIdOf(long bookingId) {
+            throw new UnsupportedOperationException("not part of this path");
+        }
+
+        @Override
+        public boolean cancel(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of this path");
+        }
+
+        @Override
+        public boolean releaseHold(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of this path");
+        }
+
+        @Override
+        public int deleteAllocations(long bookingId) {
+            throw new UnsupportedOperationException("not part of this path");
+        }
+
         @Override
         public long createHeld(NewHeldBooking booking) {
             throw new UnsupportedOperationException("not part of the payment path");

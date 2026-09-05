@@ -178,6 +178,53 @@ public interface BookingRepository {
      */
     boolean markFailed(long bookingId, Instant at);
 
+    /** API-7 addresses bookings by PNR, which is what a passenger holds. */
+    Optional<BookingView> findByPnr(String pnr);
+
+    /**
+     * The idempotency key this booking was held under, which is also its hold id
+     * (DD-009: "the same identity end-to-end").
+     *
+     * <p>A narrow read rather than a component on {@link BookingView}, because only
+     * the release path needs it and only while the booking is still {@code HELD}.
+     * Widening the view would put a value on every read that almost no caller has a
+     * use for, and one that is meaningless the moment the hold is confirmed.
+     */
+    Optional<String> holdIdOf(long bookingId);
+
+    /**
+     * FR-43: {@code CONFIRMED → CANCELLED}, as a compare-and-set.
+     *
+     * <p>Committed <b>before</b> the berths are freed in the allocator. No
+     * transaction spans Postgres and Redis, so the ordering decides which way a
+     * crash between them breaks: freeing first leaves a berth available while the
+     * booking still says {@code CONFIRMED}, and someone else buys a seat that is
+     * still sold. This way round leaves a berth stuck occupied, which §13.4's
+     * rebuild recovers.
+     */
+    boolean cancel(long bookingId, Instant at);
+
+    /**
+     * FR-43: {@code HELD → EXPIRED}, as a compare-and-set.
+     *
+     * <p>Cancelling an unpaid hold is a <em>release</em>, not a cancellation. FR-27
+     * has no {@code HELD → CANCELLED} edge, and routing one there would compute a
+     * refund against money that never moved.
+     */
+    boolean releaseHold(long bookingId, Instant at);
+
+    /**
+     * Removes a cancelled booking's {@code seat_allocations} rows.
+     *
+     * <p>Not bookkeeping. §13.4 rebuilds Redis masks <em>from Postgres</em>, so a
+     * cancelled booking whose allocation rows survived would have its berth
+     * re-occupied by the next rebuild — turning a recoverable stuck berth into a
+     * permanent one.
+     *
+     * @return how many rows were removed
+     */
+    int deleteAllocations(long bookingId);
+
     /**
      * FR-25 step 3: {@code PAYMENT_PENDING → CONFIRMED} with a PNR, as one
      * compare-and-set.

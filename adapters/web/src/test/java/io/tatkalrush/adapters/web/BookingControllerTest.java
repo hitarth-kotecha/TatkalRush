@@ -15,6 +15,7 @@ import io.tatkalrush.adapters.web.auth.JwtAuthFilter;
 import io.tatkalrush.adapters.web.auth.StubJwt;
 import io.tatkalrush.application.ports.BookingRepository;
 import io.tatkalrush.application.ports.ScheduleQuery;
+import io.tatkalrush.application.usecases.CancelBooking;
 import io.tatkalrush.application.usecases.HoldSeats;
 import io.tatkalrush.application.usecases.InitiatePayment;
 import io.tatkalrush.domain.booking.BookingStatus;
@@ -53,6 +54,8 @@ class BookingControllerTest {
     private HoldSeats holdSeats;
     private InitiatePayment initiatePayment;
     private ScheduleQuery schedules;
+    private CancelBooking cancelBooking;
+    private BookingRepository bookingRepository;
     private StubJwt jwt;
     private MockMvc mvc;
 
@@ -68,9 +71,17 @@ class BookingControllerTest {
         when(schedules.describeBerths(any()))
                 .thenReturn(List.of(new ScheduleQuery.BerthDetail(7L, "S1", 41, "LOWER")));
 
+        cancelBooking = mock(CancelBooking.class);
+        bookingRepository = mock(BookingRepository.class);
+
         var controller =
                 new BookingController(
-                        holdSeats, initiatePayment, schedules, InstantSource.fixed(NOW));
+                        holdSeats,
+                        initiatePayment,
+                        cancelBooking,
+                        bookingRepository,
+                        schedules,
+                        InstantSource.fixed(NOW));
 
         mvc =
                 MockMvcBuilders.standaloneSetup(controller)
@@ -362,6 +373,104 @@ class BookingControllerTest {
             mvc.perform(post("/api/v1/bookings/88/pay").header("Authorization", bearer()))
                     .andExpect(status().isGone())
                     .andExpect(jsonPath("$.code").value("HOLD_EXPIRED"));
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    @Nested
+    @DisplayName("API-7 and API-9")
+    class CancellingAndReading {
+
+        @Test
+        void aCancellationReportsTheRefund() throws Exception {
+            when(cancelBooking.cancel(any(), org.mockito.ArgumentMatchers.anyLong(), any()))
+                    .thenReturn(
+                            new CancelBooking.Outcome.Cancelled(
+                                    88L, 90_000L, CancelBooking.RefundSettlement.COMPLETED));
+
+            mvc.perform(
+                            post("/api/v1/bookings/PNR1/cancel")
+                                    .header("Authorization", bearer()))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.status").value("CANCELLED"))
+                    .andExpect(jsonPath("$.refundPaise").value(90_000));
+        }
+
+        /** FR-43: a released hold is not a cancellation with a zero refund. */
+        @Test
+        void aReleasedHoldSaysSoRatherThanReportingAZeroRefund() throws Exception {
+            when(cancelBooking.cancel(any(), org.mockito.ArgumentMatchers.anyLong(), any()))
+                    .thenReturn(new CancelBooking.Outcome.Released(88L));
+
+            mvc.perform(
+                            post("/api/v1/bookings/PNR1/cancel")
+                                    .header("Authorization", bearer()))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.status").value("EXPIRED"))
+                    .andExpect(jsonPath("$.refundPaise").doesNotExist());
+        }
+
+        @Test
+        void theCallersIdentityComesFromTheToken() throws Exception {
+            when(cancelBooking.cancel(any(), org.mockito.ArgumentMatchers.anyLong(), any()))
+                    .thenReturn(new CancelBooking.Outcome.Released(88L));
+
+            mvc.perform(post("/api/v1/bookings/PNR1/cancel").header("Authorization", bearer()));
+
+            verify(cancelBooking)
+                    .cancel(
+                            org.mockito.ArgumentMatchers.eq("PNR1"),
+                            org.mockito.ArgumentMatchers.eq(TOKEN_USER),
+                            any());
+        }
+
+        @Test
+        void anUnknownBookingIs404() throws Exception {
+            when(cancelBooking.cancel(any(), org.mockito.ArgumentMatchers.anyLong(), any()))
+                    .thenReturn(new CancelBooking.Outcome.UnknownBooking("PNR1"));
+
+            mvc.perform(
+                            post("/api/v1/bookings/PNR1/cancel")
+                                    .header("Authorization", bearer()))
+                    .andExpect(status().isNotFound());
+        }
+
+        @Test
+        void bookingDetailIsReturnedForItsOwner() throws Exception {
+            when(bookingRepository.findByPnr("PNR1")).thenReturn(Optional.of(confirmed(TOKEN_USER)));
+
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                            .get("/api/v1/bookings/PNR1")
+                            .header("Authorization", bearer()))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.pnr").value("PNR1"))
+                    .andExpect(jsonPath("$.status").value("CONFIRMED"));
+        }
+
+        /** Anything else makes API-9 an oracle for enumerating other people's PNRs. */
+        @Test
+        void anotherUsersBookingReadsAsAbsent() throws Exception {
+            when(bookingRepository.findByPnr("PNR1"))
+                    .thenReturn(Optional.of(confirmed(TOKEN_USER + 1)));
+
+            mvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                            .get("/api/v1/bookings/PNR1")
+                            .header("Authorization", bearer()))
+                    .andExpect(status().isNotFound());
+        }
+
+        private BookingRepository.BookingView confirmed(long owner) {
+            return new BookingRepository.BookingView(
+                    88L,
+                    Optional.of("PNR1"),
+                    BookingStatus.CONFIRMED,
+                    pool(),
+                    new SegmentRange(0, 4),
+                    1,
+                    245_000L,
+                    owner,
+                    Optional.empty(),
+                    List.of(7L));
         }
     }
 

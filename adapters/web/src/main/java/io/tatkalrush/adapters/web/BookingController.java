@@ -1,6 +1,8 @@
 package io.tatkalrush.adapters.web;
 
 import io.tatkalrush.application.ports.ScheduleQuery;
+import io.tatkalrush.application.ports.BookingRepository;
+import io.tatkalrush.application.usecases.CancelBooking;
 import io.tatkalrush.application.usecases.HoldSeats;
 import io.tatkalrush.application.usecases.HoldSeats.HoldSeatsCommand;
 import io.tatkalrush.application.usecases.InitiatePayment;
@@ -18,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -52,16 +55,22 @@ public class BookingController {
 
     private final HoldSeats holdSeats;
     private final InitiatePayment initiatePayment;
+    private final CancelBooking cancelBooking;
+    private final BookingRepository bookings;
     private final ScheduleQuery schedules;
     private final InstantSource clock;
 
     public BookingController(
             HoldSeats holdSeats,
             InitiatePayment initiatePayment,
+            CancelBooking cancelBooking,
+            BookingRepository bookings,
             ScheduleQuery schedules,
             InstantSource clock) {
         this.holdSeats = holdSeats;
         this.initiatePayment = initiatePayment;
+        this.cancelBooking = cancelBooking;
+        this.bookings = bookings;
         this.schedules = schedules;
         this.clock = clock;
     }
@@ -347,6 +356,78 @@ public class BookingController {
             case InitiatePayment.Result.UnknownBooking ignored ->
                     ApiProblem.of(ApiError.NOT_FOUND, "no such booking: " + bookingId);
         };
+    }
+
+    // ── API-7 ───────────────────────────────────────────────────────────────
+
+    /**
+     * Cancels a booking, by PNR because that is what a passenger holds.
+     *
+     * <p>{@code 200} for both outcomes. A release and a cancellation are different
+     * operations (FR-43) but the caller asked for the same thing and got it; the
+     * body says which happened and what, if anything, is coming back.
+     */
+    @PostMapping("/{pnr}/cancel")
+    public ResponseEntity<?> cancel(@PathVariable("pnr") String pnr) {
+        var outcome = cancelBooking.cancel(pnr, RequestContext.userId(), clock.instant());
+
+        return switch (outcome) {
+            case CancelBooking.Outcome.Cancelled cancelled ->
+                    ResponseEntity.ok(
+                            Map.of(
+                                    "bookingId", cancelled.bookingId(),
+                                    "status", "CANCELLED",
+                                    "refundPaise", cancelled.refundPaise(),
+                                    "refundStatus", cancelled.settlement().name()));
+
+            case CancelBooking.Outcome.Released released ->
+                    // FR-43: releasing an unpaid hold is not a cancellation, and
+                    // the response says so rather than reporting a refund of zero
+                    // as though one had been considered.
+                    ResponseEntity.ok(
+                            Map.of(
+                                    "bookingId", released.bookingId(),
+                                    "status", "EXPIRED",
+                                    "detail", "an unpaid hold was released; no payment was involved"));
+
+            case CancelBooking.Outcome.AlreadyResolved resolved ->
+                    ResponseEntity.ok(
+                            Map.of("bookingId", resolved.bookingId(), "status", "ALREADY_RESOLVED"));
+
+            case CancelBooking.Outcome.NotCancellable notCancellable ->
+                    ApiProblem.of(
+                            ApiError.INVALID_REQUEST,
+                            "a booking in " + notCancellable.status() + " cannot be cancelled");
+
+            // Deliberately the same answer as another user's booking. Anything
+            // else makes this endpoint an oracle for enumerating PNRs.
+            case CancelBooking.Outcome.UnknownBooking ignored ->
+                    ApiProblem.of(ApiError.NOT_FOUND, "no such booking");
+        };
+    }
+
+    // ── API-9 ───────────────────────────────────────────────────────────────
+
+    @GetMapping("/{pnr}")
+    public ResponseEntity<?> byPnr(@PathVariable("pnr") String pnr) {
+        return bookings.findByPnr(pnr)
+                // Same reasoning as API-7: another caller's booking reads as
+                // absent, so the endpoint cannot be used to probe for PNRs.
+                .filter(booking -> booking.userId() == RequestContext.userId())
+                .<ResponseEntity<?>>map(
+                        booking -> {
+                            var body = new LinkedHashMap<String, Object>();
+                            body.put("bookingId", booking.id());
+                            booking.pnr().ifPresent(value -> body.put("pnr", value));
+                            body.put("status", booking.status().name());
+                            body.put("passengerCount", booking.passengerCount());
+                            body.put("farePaise", booking.farePaise());
+                            booking.holdExpiresAt()
+                                    .ifPresent(at -> body.put("expiresAt", at.toString()));
+                            body.put("allocations", allocations(booking.berthIds()));
+                            return ResponseEntity.ok(body);
+                        })
+                .orElseGet(() -> ApiProblem.of(ApiError.NOT_FOUND, "no such booking"));
     }
 
     // ── request translation ─────────────────────────────────────────────────
