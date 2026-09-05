@@ -66,6 +66,14 @@
         <configuration>
           <compilerArgs>
             <arg>--enable-preview</arg>
+            <!--
+              Repeated from the root POM on purpose. Maven merges plugin
+              CONFIGURATION, but a child's <compilerArgs> LIST replaces the
+              inherited one rather than appending to it. So declaring the preview
+              flag here silently dropped -parameters, in the one module where
+              losing it breaks every @PathVariable handler at request time.
+            -->
+            <arg>-parameters</arg>
           </compilerArgs>
         </configuration>
       </plugin>

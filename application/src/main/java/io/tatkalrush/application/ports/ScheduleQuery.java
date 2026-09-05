@@ -5,6 +5,7 @@ import io.tatkalrush.domain.inventory.SegmentRange;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -48,4 +49,36 @@ public interface ScheduleQuery {
      * a pricing mismatch.
      */
     BigDecimal distanceKm(long scheduleId, SegmentRange range);
+
+    /**
+     * Translates the two station codes a caller knows into the segment range the
+     * allocator needs.
+     *
+     * <p>§11.1's request carries {@code fromStationCode} and {@code toStationCode},
+     * because that is what a passenger knows. Everything below this port speaks
+     * segment indices, because that is what a 64-bit mask addresses. Doing the
+     * translation here rather than in the controller keeps it a single query
+     * instead of two lookups and an arithmetic mistake waiting to happen.
+     *
+     * <p>Empty when either station is not on this train's route, or when they are
+     * in the wrong order — a passenger cannot travel Mumbai to Delhi on a train
+     * running Delhi to Mumbai, and expressing that as a negative range would
+     * produce an empty mask that conflicts with nothing and appears to succeed
+     * against every berth.
+     */
+    Optional<SegmentRange> resolveRange(
+            long scheduleId, String fromStationCode, String toStationCode);
+
+    /**
+     * Where a berth physically is, for §11.1's {@code allocations} block.
+     *
+     * @param berthId matches what the allocator returned
+     * @param coachCode e.g. {@code "S1"}
+     * @param ordinal the berth's number within its coach
+     * @param berthType {@code LOWER}, {@code SIDE_UPPER} and so on
+     */
+    record BerthDetail(long berthId, String coachCode, int ordinal, String berthType) {}
+
+    /** Ordered to match {@code berthIds}, so a response lists berths as allocated. */
+    List<BerthDetail> describeBerths(List<Long> berthIds);
 }

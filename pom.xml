@@ -82,6 +82,29 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
           <version>${maven-compiler-plugin.version}</version>
+          <configuration>
+            <!--
+              -parameters keeps formal parameter names in the class file.
+
+              spring-boot-starter-parent sets this; DD-005 imports the BOM instead
+              of inheriting that parent, and a BOM carries dependency versions
+              only - never build configuration. So the flag has to be set here.
+
+              It is not cosmetic. Spring MVC recovers @PathVariable and
+              @RequestParam names by reflection when the annotation does not give
+              one, and without the flag every such handler throws at REQUEST time:
+              "Name for argument of type [long] not specified". A startup that
+              looks perfectly healthy, and a 500 on the first call.
+
+              Found by the first controller to take a path variable, six weeks
+              after DD-005 was written. Annotations in this codebase name their
+              parameters explicitly as well - relying on a compiler flag for
+              correctness is one flag away from this happening again.
+            -->
+            <compilerArgs>
+              <arg>-parameters</arg>
+            </compilerArgs>
+          </configuration>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>

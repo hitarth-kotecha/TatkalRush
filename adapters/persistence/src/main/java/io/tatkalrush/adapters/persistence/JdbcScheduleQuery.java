@@ -8,6 +8,7 @@ import io.tatkalrush.domain.inventory.TravelClass;
 import java.math.BigDecimal;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.List;
 import java.util.Optional;
 import javax.sql.DataSource;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -103,6 +104,82 @@ public final class JdbcScheduleQuery implements ScheduleQuery {
                                                         range.fromSeq(),
                                                         range.toSeq(),
                                                         scheduleId)));
+    }
+
+    @Override
+    public Optional<SegmentRange> resolveRange(
+            long scheduleId, String fromStationCode, String toStationCode) {
+
+        return jdbc.sql(
+                        """
+                        SELECT from_stop.seq AS from_seq, to_stop.seq AS to_seq
+                        FROM schedules s
+                        JOIN train_stops from_stop ON from_stop.train_id = s.train_id
+                        JOIN stations from_station
+                          ON from_station.id = from_stop.station_id AND from_station.code = ?
+                        JOIN train_stops to_stop ON to_stop.train_id = s.train_id
+                        JOIN stations to_station
+                          ON to_station.id = to_stop.station_id AND to_station.code = ?
+                        WHERE s.id = ?
+                        """)
+                .param(fromStationCode)
+                .param(toStationCode)
+                .param(scheduleId)
+                .query(
+                        (ResultSet rs, int rowNum) ->
+                                new int[] {rs.getInt("from_seq"), rs.getInt("to_seq")})
+                .optional()
+                // from >= to means the stations are in the wrong order for this
+                // train's direction. Empty rather than a negative range: SegmentRange
+                // would reject it anyway, and an exception here would turn a
+                // routine client mistake into a 500.
+                .filter(seqs -> seqs[0] < seqs[1])
+                .map(seqs -> new SegmentRange(seqs[0], seqs[1]));
+    }
+
+    @Override
+    public List<BerthDetail> describeBerths(List<Long> berthIds) {
+        if (berthIds.isEmpty()) {
+            return List.of();
+        }
+
+        // Placeholders expanded rather than a bound array, as elsewhere in this
+        // module: JdbcClient has no portable SQL-array binding and berthIds is
+        // 1..6 entries.
+        String placeholders =
+                String.join(", ", java.util.Collections.nCopies(berthIds.size(), "?"));
+
+        var statement =
+                jdbc.sql(
+                        """
+                        SELECT b.id, c.code AS coach_code, b.ordinal, b.berth_type
+                        FROM berths b
+                        JOIN coaches c ON c.id = b.coach_id
+                        WHERE b.id IN (%s)
+                        """
+                                .formatted(placeholders));
+        for (long berthId : berthIds) {
+            statement = statement.param(berthId);
+        }
+
+        var byId =
+                statement
+                        .query(
+                                (ResultSet rs, int rowNum) ->
+                                        new BerthDetail(
+                                                rs.getLong("id"),
+                                                rs.getString("coach_code"),
+                                                rs.getInt("ordinal"),
+                                                rs.getString("berth_type")))
+                        .list()
+                        .stream()
+                        .collect(
+                                java.util.stream.Collectors.toMap(BerthDetail::berthId, d -> d));
+
+        // Re-ordered to match the request. The IN clause returns rows in whatever
+        // order the planner likes, and §11.1's allocations block should list
+        // berths in the order they were allocated - passenger i to berth i.
+        return berthIds.stream().map(byId::get).filter(java.util.Objects::nonNull).toList();
     }
 
     /** Convenience for callers holding ids rather than a {@link PoolKey}. */

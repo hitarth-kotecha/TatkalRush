@@ -617,5 +617,20 @@ class HoldSeatsTest {
             // §6.9's worked example: NDLS->RTM is 730 km.
             return new BigDecimal("730");
         }
+
+        // The API boundary's two translations. Not part of HoldSeats' own
+        // orchestration - the controller resolves station codes before building
+        // the command - so unimplemented rather than faked.
+
+        @Override
+        public Optional<SegmentRange> resolveRange(
+                long scheduleId, String fromStationCode, String toStationCode) {
+            throw new UnsupportedOperationException("resolved at the API boundary");
+        }
+
+        @Override
+        public List<BerthDetail> describeBerths(List<Long> berthIds) {
+            throw new UnsupportedOperationException("resolved at the API boundary");
+        }
     }
 }
