@@ -218,6 +218,59 @@ public final class BerthPool {
         return reaped;
     }
 
+    /**
+     * Frees berths belonging to a <em>confirmed</em> booking (FR-43).
+     *
+     * <p>{@link #confirm} deletes the hold record, so {@link #release} can no
+     * longer reach these berths — which is the point of confirming, since the
+     * reaper must never sweep a berth someone has paid for. Cancellation therefore
+     * has to say which berths, from the booking row that owns them.
+     *
+     * <h2>It counts what it clears, not what it was asked to clear</h2>
+     *
+     * <p>{@link #releaseHold} may increment a segment's free count by the whole
+     * berth count, because it created the hold and knows every one of those berths
+     * had every bit of the range set. Nothing guarantees that here. This runs from
+     * a user cancellation, a retry of one, and a chart-time sweep, and it must be
+     * safe to run twice — so a bit that is already clear must contribute nothing.
+     *
+     * <p>Hence the per-segment test below rather than a single multiply. Getting it
+     * wrong inflates {@code freeCount}: the pool reports berths it does not have,
+     * INV-12 fails at the next quiesce point, and the number it corrupts is
+     * upstream of the metric §9.4's conclusion rests on.
+     *
+     * @return how many (berth, segment) bits were actually cleared. Zero means the
+     *     berths were already free, which is a successful no-op rather than an
+     *     error.
+     */
+    public int releaseConfirmed(SegmentRange range, List<Integer> berthOrdinals) {
+        long requestMask = SegmentMask.of(range.fromSeq(), range.toSeq());
+        int cleared = 0;
+
+        for (int seg = range.fromSeq(); seg < range.toSeq(); seg++) {
+            long segmentBit = 1L << seg;
+            int freedOnSegment = 0;
+
+            for (int ordinal : berthOrdinals) {
+                if ((masks[ordinal] & segmentBit) != 0) {
+                    freedOnSegment++;
+                }
+            }
+
+            freeCount[seg] += freedOnSegment;
+            cleared += freedOnSegment;
+        }
+
+        // Cleared after counting, so the count observes the state it is describing.
+        // AND NOT: another booking occupying a different leg of the same berth is
+        // untouched, which is the whole of what segment-wise inventory buys.
+        for (int ordinal : berthOrdinals) {
+            masks[ordinal] = SegmentMask.release(masks[ordinal], requestMask);
+        }
+
+        return cleared;
+    }
+
     private void releaseHold(Hold hold) {
         for (int ordinal : hold.berthOrdinals()) {
             masks[ordinal] = SegmentMask.release(masks[ordinal], hold.requestMask());

@@ -67,6 +67,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-034](#dd-034) | Settlement is deduped twice, because FR-22's key alone is not enough | 1 |
 | [DD-035](#dd-035) | A correct outcome that must not persist needs a rollback that is not an exception | 1 |
 | [DD-036](#dd-036) | The PSP draws its verdict once, at charge time | 1 |
+| [DD-037](#dd-037) | Cancelling a confirmed booking needs an allocator operation that did not exist | 1 |
 
 ---
 
@@ -2205,6 +2206,81 @@ to reproduce a reported failure exactly, say — the single seed is insufficient
 alternative 3 becomes necessary. The falsifiable form: if any test or scenario has
 to run the simulator single-threaded to get a repeatable result, the seeding
 strategy is wrong.
+
+---
+
+<a id="dd-037"></a>
+### DD-037 — Cancelling a confirmed booking needs an allocator operation that did not exist
+
+Date: 2026-09-06 · Author: Phase 1b · Phase: 1 · Requirements: FR-41, FR-43, INV-12, DD-012
+Supersedes: —
+
+**Context.**
+
+FR-43 says cancelling a confirmed booking "releases its berth range". The allocator
+could not do it.
+
+`confirm(holdId)` deletes the hold record on purpose — that is what stops the
+reaper sweeping a berth someone has paid for — and that record was the only handle
+`release(holdId)` uses. After confirmation the mask bits are set with nothing
+pointing at them. Without a new operation a cancelled berth stays occupied in Redis
+until a full rebuild, and FR-41's promotion has nothing to promote into.
+
+**Decision.**
+
+`SeatAllocator.releaseConfirmed(pool, range, berthIds)`, taking the berths
+explicitly because there is no hold left to name them. The booking row is the
+durable record of what it owns; Redis is the cache being corrected to match it.
+
+It is **idempotent**, and that requirement drives the arithmetic. `release.lua` may
+add the berth count to every occupied segment's free count, because it created the
+hold and knows every one of those berths carried every bit of the range. Nothing
+guarantees that here — cancellation arrives from a user request, a retry of one,
+and chart preparation, any of which can arrive twice. So this counts **per (berth,
+segment), testing each bit before clearing it**.
+
+**Alternatives considered.**
+
+1. **Rejected — keep the hold record after confirmation so `release` still works.**
+   One fewer operation and no new Lua. It reintroduces exactly what `confirm`
+   exists to prevent: a record the reaper can see, and therefore a paid berth that
+   gets swept when its original TTL passes. `BerthPool.confirm`'s own comment says
+   INV-4 would find the orphan long after the customer did.
+
+2. **Rejected — cancel in Postgres only and let Redis be rebuilt.** Correct in the
+   durable record and useless in practice: the berth cannot be resold until a
+   rebuild, which defeats FR-41's promotion entirely and would make cancellations
+   invisible to availability for as long as a run lasts.
+
+3. **Rejected — reuse `release.lua`'s counting shortcut for speed.** Multiplying a
+   berth count by a segment is one line instead of a nested loop. Under idempotency
+   it adds phantom berths: the mutation test that does this gains **eight** on a
+   two-berth booking's second cancellation.
+
+**Consequences.**
+
+A mutation exposed a hole in the contract suite rather than in the code, and the
+reason generalises. **`availability` is computed from the free counts, so every
+assertion that reads it is blind to mask corruption.** Clearing the entire mask
+instead of the range's bits passed all sixteen contract tests — the counting loop
+still counted correctly, and the corrupted masks were simply never observed.
+
+The suite now cancels *both* legs of a shared berth and requires it to come fully
+back. That forces mask and count to agree: with the mask wrongly zeroed the second
+release counts nothing, the counts never recover, and the berth stays invisible for
+the rest of the pool's life. It fails with `expected: <1> but was: <0>`.
+
+Mask and count disagreeing while each looks locally fine is INV-12's whole subject,
+and a suite that only ever reads one of them cannot see it. Worth remembering for
+every other observation this project makes through a derived value.
+
+**What would change this.**
+
+If Strategy B's partition owner keeps enough per-booking state to name a confirmed
+allocation without being told, this operation could take an identifier again and
+the caller would stop needing to pass berths it read from Postgres. The falsifiable
+form: if `releaseConfirmed` is ever called with berth ids the caller did not read
+from the booking row, the argument above no longer holds and the signature is wrong.
 
 ---
 

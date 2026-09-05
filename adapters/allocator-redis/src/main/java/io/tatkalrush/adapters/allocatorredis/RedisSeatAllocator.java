@@ -162,6 +162,37 @@ public final class RedisSeatAllocator implements SeatAllocator {
         redis.del(holdPoolKey(holdId));
     }
 
+    /**
+     * FR-43: frees a confirmed booking's berths.
+     *
+     * <p>Takes the berths explicitly because there is no hold left to name them —
+     * {@code confirm} removed it, so the reaper could not sweep a paid berth. See
+     * the port for why this must be idempotent and what that costs the free-count
+     * arithmetic.
+     */
+    @Override
+    public int releaseConfirmed(PoolKey pool, SegmentRange range, List<Long> berthIds) {
+        if (berthIds.isEmpty()) {
+            return 0;
+        }
+
+        var args = new ArrayList<String>(berthIds.size() + 3);
+        args.add(String.valueOf(range.fromSeq()));
+        args.add(String.valueOf(range.toSeq()));
+        args.add(String.valueOf(shapeOf(pool).segmentCount()));
+        for (long berthId : berthIds) {
+            args.add(String.valueOf(ordinalOf(pool, berthId)));
+        }
+
+        Long cleared =
+                scripts.run(
+                        "release-confirmed",
+                        ScriptOutputType.INTEGER,
+                        poolKeys(pool),
+                        args.toArray(String[]::new));
+        return cleared == null ? 0 : cleared.intValue();
+    }
+
     // --------------------------------------------------------------- confirm
 
     @Override
@@ -332,5 +363,18 @@ public final class RedisSeatAllocator implements SeatAllocator {
      */
     private long berthIdOf(PoolKey pool, int ordinal) {
         return pool.scheduleId() * 1000L + ordinal;
+    }
+
+    /** The inverse of {@link #berthIdOf}, and it must stay the exact inverse. */
+    private int ordinalOf(PoolKey pool, long berthId) {
+        long ordinal = berthId - pool.scheduleId() * 1000L;
+        if (ordinal < 0 || ordinal > Integer.MAX_VALUE) {
+            // A berth id from another pool. Refusing beats clearing whatever bit
+            // the arithmetic happens to land on, which would free a berth
+            // belonging to a booking nobody cancelled.
+            throw new IllegalArgumentException(
+                    "berth %d does not belong to pool %s".formatted(berthId, pool));
+        }
+        return (int) ordinal;
     }
 }

@@ -64,6 +64,27 @@ public interface SeatAllocator {
     ConfirmResult confirm(String holdId, long bookingId);
 
     /**
+     * Frees the berths of a <b>confirmed</b> booking (FR-43).
+     *
+     * <p>Not expressible as {@link #release}. Confirming deletes the hold record —
+     * deliberately, so the reaper can never sweep a berth someone has paid for —
+     * and that record was the only handle {@code release} had. After confirmation
+     * the bits are set with nothing pointing at them, so cancellation must say
+     * which berths, from the booking row that owns them.
+     *
+     * <p><b>Idempotent.</b> Cancellation arrives from a user request, a retry of
+     * one, and chart preparation, and any of them can beat the others to the same
+     * booking. Running twice must free the berths once — which for an
+     * implementation maintaining free counts means counting the bits it actually
+     * clears rather than the berths it was handed.
+     *
+     * @param berthIds the booking's berths, as the allocator reported them
+     * @return how many (berth, segment) bits were cleared; zero is a successful
+     *     no-op, not a failure
+     */
+    int releaseConfirmed(PoolKey pool, SegmentRange range, java.util.List<Long> berthIds);
+
+    /**
      * Berths available for a range, without allocating (FR-13).
      *
      * <p>Approximate by design: it is served from a short-TTL cache (FR-15) and

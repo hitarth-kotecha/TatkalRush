@@ -191,6 +191,118 @@ class BerthPoolTest {
     }
 
     @Nested
+    @DisplayName("FR-43: releasing a CONFIRMED booking")
+    class ReleasingConfirmed {
+
+        /** confirm() drops the hold record, so release() can no longer reach it. */
+        @Test
+        @DisplayName("release cannot reach a confirmed booking, which is why this exists")
+        void releaseCannotReachAConfirmedBooking() {
+            var pool = new BerthPool(4, 4);
+            pool.allocate(SegmentRange.of(0, 4), 1, "h1", T0, TTL);
+            pool.confirm("h1");
+
+            assertFalse(pool.release("h1"), "the hold record is gone by design");
+            assertEquals(3, pool.freeOn(SegmentRange.of(0, 4)), "and the berth is still taken");
+        }
+
+        @Test
+        @DisplayName("it frees the berths and restores the counts")
+        void freesTheBerths() {
+            var pool = new BerthPool(4, 4);
+            var allocated = allocatedBy(pool, SegmentRange.of(0, 4), 2, "h1", T0, TTL);
+            pool.confirm("h1");
+
+            int cleared = pool.releaseConfirmed(SegmentRange.of(0, 4), allocated.berthOrdinals());
+
+            assertEquals(8, cleared, "two berths across four segments");
+            assertEquals(4, pool.freeOn(SegmentRange.of(0, 4)));
+            pool.checkInvariants();
+        }
+
+        /**
+         * The test this whole operation is careful for.
+         *
+         * <p>A retried cancellation must free the berths once. Counting the berths
+         * it was HANDED rather than the bits it actually CLEARED would add them a
+         * second time, and the pool would report more berths than it has - INV-12's
+         * drift, on the counter upstream of the metric §9.4 rests on.
+         */
+        @Test
+        @DisplayName("running it twice frees the berths once")
+        void isIdempotent() {
+            var pool = new BerthPool(4, 4);
+            var allocated = allocatedBy(pool, SegmentRange.of(0, 4), 2, "h1", T0, TTL);
+            pool.confirm("h1");
+
+            pool.releaseConfirmed(SegmentRange.of(0, 4), allocated.berthOrdinals());
+            int second = pool.releaseConfirmed(SegmentRange.of(0, 4), allocated.berthOrdinals());
+
+            assertEquals(0, second, "the second run cleared nothing and must have counted nothing");
+            assertEquals(4, pool.freeOn(SegmentRange.of(0, 4)), "not 6");
+            pool.checkInvariants();
+        }
+
+        /** Segment-wise inventory: another booking on a different leg is untouched. */
+        @Test
+        @DisplayName("it frees only the cancelled booking's segments")
+        void leavesOtherLegsAlone() {
+            var pool = new BerthPool(1, 4);
+
+            var first = allocatedBy(pool, SegmentRange.of(0, 2), 1, "h1", T0, TTL);
+            pool.confirm("h1");
+            var second = allocatedBy(pool, SegmentRange.of(2, 4), 1, "h2", T0, TTL);
+            pool.confirm("h2");
+
+            assertEquals(first.berthOrdinals(), second.berthOrdinals(), "T-3: one berth, two legs");
+
+            pool.releaseConfirmed(SegmentRange.of(0, 2), first.berthOrdinals());
+
+            assertEquals(1, pool.freeOn(SegmentRange.of(0, 2)), "the cancelled leg is free");
+            assertEquals(0, pool.freeOn(SegmentRange.of(2, 4)), "the other passenger still has it");
+            pool.checkInvariants();
+        }
+
+        @Test
+        @DisplayName("releasing berths that were never taken is a no-op, not a gift")
+        void releasingFreeBerthsChangesNothing() {
+            var pool = new BerthPool(4, 4);
+
+            int cleared = pool.releaseConfirmed(SegmentRange.of(0, 4), java.util.List.of(0, 1));
+
+            assertEquals(0, cleared);
+            assertEquals(4, pool.freeOn(SegmentRange.of(0, 4)), "still four, not six");
+            pool.checkInvariants();
+        }
+
+        @Test
+        @DisplayName("a partially-overlapping range frees only the bits that were set")
+        void countsOnlyTheBitsThatWereSet() {
+            var pool = new BerthPool(1, 4);
+            var allocated = allocatedBy(pool, SegmentRange.of(1, 3), 1, "h1", T0, TTL);
+            pool.confirm("h1");
+
+            // Asked to free [0,4); only segments 1 and 2 were ever occupied.
+            int cleared = pool.releaseConfirmed(SegmentRange.of(0, 4), allocated.berthOrdinals());
+
+            assertEquals(2, cleared, "one berth, two occupied segments - not four");
+            assertEquals(1, pool.freeOn(SegmentRange.of(0, 4)));
+            pool.checkInvariants();
+        }
+
+        /** Unwraps the sealed result; every allocation here is expected to succeed. */
+        private AllocationResult.Allocated allocatedBy(
+                BerthPool pool,
+                SegmentRange range,
+                int passengers,
+                String holdId,
+                Instant now,
+                long ttl) {
+            return (AllocationResult.Allocated) pool.allocate(range, passengers, holdId, now, ttl);
+        }
+    }
+
+    @Nested
     @DisplayName("holds and lazy reaping (§9.2)")
     class Holds {
 

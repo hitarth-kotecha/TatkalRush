@@ -95,6 +95,20 @@ public final class InMemorySeatAllocator implements SeatAllocator {
     }
 
     @Override
+    public int releaseConfirmed(PoolKey pool, SegmentRange range, List<Long> berthIds) {
+        PoolState state = pools.get(pool);
+        if (state == null) {
+            return 0;
+        }
+        // The port's ordinals are positions in this pool's berth list, so the
+        // reverse mapping is an index lookup rather than arithmetic.
+        var ordinals = berthIds.stream().map(state.berthIds()::indexOf).filter(i -> i >= 0).toList();
+        synchronized (state.lock()) {
+            return state.pool().releaseConfirmed(range, ordinals);
+        }
+    }
+
+    @Override
     public void release(String holdId) {
         PoolKey key = holdLocations.remove(holdId);
         if (key == null) {

@@ -290,6 +290,112 @@ public abstract class SeatAllocatorContract {
         assertInstanceOf(ConfirmResult.HoldExpired.class, allocator().confirm("h", 1L));
     }
 
+    // ------------------------------------------------- releasing a confirmation
+
+    @Test
+    @DisplayName("FR-43: a confirmed booking's berths can be freed, and release cannot do it")
+    void releaseConfirmedFreesTheBerths() {
+        var pool = givenPool(2, 4);
+        var held = allocated(allocator().allocate(request(pool, 0, 4, 1, "h")));
+        allocator().confirm("h", 1L);
+
+        // The hold record is gone by design, so this frees nothing.
+        allocator().release("h");
+        assertEquals(
+                1,
+                allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths(),
+                "release must NOT reach a confirmed booking - if it does, the reaper can too");
+
+        int cleared = allocator().releaseConfirmed(pool, SegmentRange.of(0, 4), held.berthIds());
+
+        assertEquals(4, cleared, "one berth across four segments");
+        assertEquals(2, allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths());
+    }
+
+    /**
+     * The property both implementations have to agree on, and the one that is easy
+     * to get wrong in the direction that inflates inventory.
+     */
+    @Test
+    @DisplayName("releasing a confirmed booking twice frees its berths once")
+    void releaseConfirmedIsIdempotent() {
+        var pool = givenPool(2, 4);
+        var held = allocated(allocator().allocate(request(pool, 0, 4, 2, "h")));
+        allocator().confirm("h", 1L);
+
+        allocator().releaseConfirmed(pool, SegmentRange.of(0, 4), held.berthIds());
+        int second = allocator().releaseConfirmed(pool, SegmentRange.of(0, 4), held.berthIds());
+
+        assertEquals(0, second, "the second run cleared nothing and must count nothing");
+        assertEquals(
+                2,
+                allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths(),
+                "the pool has two berths; reporting more is INV-12's drift");
+    }
+
+    @Test
+    @DisplayName("it frees only the cancelled booking's segments (T-3 in reverse)")
+    void releaseConfirmedLeavesOtherLegsAlone() {
+        var pool = givenPool(1, 4);
+
+        var first = allocated(allocator().allocate(request(pool, 0, 2, 1, "h1")));
+        allocator().confirm("h1", 1L);
+        var second = allocated(allocator().allocate(request(pool, 2, 4, 1, "h2")));
+        allocator().confirm("h2", 2L);
+
+        assertEquals(first.berthIds(), second.berthIds(), "one berth, two complementary legs");
+
+        allocator().releaseConfirmed(pool, SegmentRange.of(0, 2), first.berthIds());
+
+        assertEquals(1, allocator().availability(pool, SegmentRange.of(0, 2)).freeBerths());
+        assertEquals(
+                0,
+                allocator().availability(pool, SegmentRange.of(2, 4)).freeBerths(),
+                "the other passenger has not been cancelled");
+
+        // Then cancel the second leg too, and require the berth to come FULLY
+        // back. This is the assertion that observes the masks rather than the
+        // free counts.
+        //
+        // Everything above reads availability, which is computed from the free
+        // counts - so a mutation that corrupts only the MASKS leaves every
+        // assertion above green. Clearing the whole mask instead of the range's
+        // bits did exactly that and survived. It is caught here because the second
+        // release counts the bits it clears: with the mask already wrongly zeroed
+        // it counts none, the counts never recover, and the berth stays invisible
+        // for the rest of the pool's life.
+        //
+        // Mask and count disagreeing while each looks locally fine is INV-12's
+        // whole subject, and a suite that only ever reads one of them cannot see it.
+        allocator().releaseConfirmed(pool, SegmentRange.of(2, 4), second.berthIds());
+
+        assertEquals(
+                1,
+                allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths(),
+                "both legs cancelled, so the berth must be fully available again");
+    }
+
+    @Test
+    @DisplayName("releasing berths that were never taken changes nothing")
+    void releaseConfirmedOnFreeBerthsIsANoOp() {
+        var pool = givenPool(3, 4);
+
+        // Berths this pool really has, made free again - rather than
+        // berthIdsOf(pool), whose implementations differ over whether it means
+        // "this pool's berths" or "ids available for provisioning".
+        var held = allocated(allocator().allocate(request(pool, 0, 4, 2, "h")));
+        allocator().release("h");
+        assertEquals(3, allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths());
+
+        int cleared = allocator().releaseConfirmed(pool, SegmentRange.of(0, 4), held.berthIds());
+
+        assertEquals(0, cleared);
+        assertEquals(
+                3,
+                allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths(),
+                "still three, not five");
+    }
+
     // ---------------------------------------------------------- availability
 
     @Test
