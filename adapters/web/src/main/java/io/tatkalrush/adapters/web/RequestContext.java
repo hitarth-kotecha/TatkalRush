@@ -41,7 +41,32 @@ public final class RequestContext {
      */
     public static final ScopedValue<String> ADMISSION_TOKEN = ScopedValue.newInstance();
 
+    /**
+     * The authenticated caller (FR-59).
+     *
+     * <p>Bound by {@code JwtAuthFilter} from the token's subject and read by the
+     * controllers. <b>Never populated from a request body</b> — that is FR-59's
+     * actual requirement, and the enforcement is that no request DTO has a field
+     * for it to come from.
+     */
+    public static final ScopedValue<Long> USER_ID = ScopedValue.newInstance();
+
     private RequestContext() {}
+
+    /**
+     * The authenticated caller.
+     *
+     * @throws IllegalStateException outside an authenticated request. Throwing
+     *     rather than returning a default: there is no safe user id to fall back
+     *     to, and a booking attributed to user 0 would be worse than a 500.
+     */
+    public static long userId() {
+        if (!USER_ID.isBound()) {
+            throw new IllegalStateException(
+                    "no authenticated user bound; this endpoint must be behind JwtAuthFilter (FR-59)");
+        }
+        return USER_ID.get();
+    }
 
     /** The current correlation id, or {@code "none"} outside a request scope. */
     public static String correlationId() {
