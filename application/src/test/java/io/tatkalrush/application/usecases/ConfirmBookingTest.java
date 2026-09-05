@@ -642,6 +642,16 @@ class ConfirmBookingTest {
             throw new UnsupportedOperationException("not part of the confirmation path");
         }
 
+        @Override
+        public boolean beginPayment(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
+        @Override
+        public boolean markFailed(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
         private static BookingView withId(BookingView v, long id) {
             return new BookingView(
                     id,
@@ -715,6 +725,39 @@ class ConfirmBookingTest {
         @Override
         public void recordLedgerEntry(long bookingId, LedgerEntryType type, long amountPaise) {
             ledger.add(type + ":" + amountPaise);
+        }
+
+        // Settlement (FR-21 to FR-23). Confirmation is called with the payment
+        // already captured, so none of this is reachable from here.
+
+        @Override
+        public Optional<PaymentRecord> findFor(long bookingId) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
+        @Override
+        public Optional<PaymentRecord> findByReference(String paymentReference) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
+        @Override
+        public long create(NewPayment payment) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
+        @Override
+        public boolean settle(String reference, PaymentStatus terminal, Instant settledAt) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
+        @Override
+        public boolean recordEvent(String reference, String eventType, String payload) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
+        }
+
+        @Override
+        public List<PendingSettlement> findPendingSettlements(Instant cutoff, int limit) {
+            throw new UnsupportedOperationException("not part of the confirmation path");
         }
     }
 

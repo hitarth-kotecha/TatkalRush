@@ -130,6 +130,29 @@ public interface BookingRepository {
             long bookingId, long scheduleId, SegmentRange range, List<Long> berthIds);
 
     /**
+     * FR-21: {@code HELD → PAYMENT_PENDING}, as a compare-and-set.
+     *
+     * <p>This transition <b>is</b> API-5's idempotency. A second initiation finds
+     * the booking already in {@code PAYMENT_PENDING} and returns the existing
+     * payment rather than opening a second charge, so no {@code Idempotency-Key}
+     * header is needed here — when the state machine already admits exactly one
+     * caller, a key adds ceremony and a second thing to keep consistent.
+     *
+     * @return whether this caller performed the transition
+     */
+    boolean beginPayment(long bookingId, Instant at);
+
+    /**
+     * {@code PAYMENT_PENDING → FAILED} (FR-27), as a compare-and-set.
+     *
+     * <p>Distinct from {@link #markFailedRefunded}: {@code FAILED} means nothing
+     * was ever captured, so nothing is owed back. Routing a declined charge
+     * through the refund path would compute a refund against money that never
+     * moved.
+     */
+    boolean markFailed(long bookingId, Instant at);
+
+    /**
      * FR-25 step 3: {@code PAYMENT_PENDING → CONFIRMED} with a PNR, as one
      * compare-and-set.
      *

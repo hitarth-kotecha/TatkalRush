@@ -491,6 +491,16 @@ class HoldSeatsTest {
         }
 
         @Override
+        public boolean beginPayment(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of the hold path");
+        }
+
+        @Override
+        public boolean markFailed(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of the hold path");
+        }
+
+        @Override
         public AllocationOutcome persistAllocations(
                 long bookingId, long scheduleId, SegmentRange range, List<Long> berthIds) {
             throw new UnsupportedOperationException("not part of the hold path");

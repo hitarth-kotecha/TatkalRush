@@ -64,6 +64,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-031](#dd-031) | Strategy A needs three Redis keys §10.5 does not list | 1 |
 | [DD-032](#dd-032) | A PNR is issued at confirmation, and V4 said otherwise | 1 |
 | [DD-033](#dd-033) | A duplicate confirmation is caught before the insert, not after | 1 |
+| [DD-034](#dd-034) | Settlement is deduped twice, because FR-22's key alone is not enough | 1 |
 
 ---
 
@@ -1940,6 +1941,96 @@ by something that does not depend on a lock the caller may not hold. The
 falsifiable form: if any caller of `persistAllocations` is ever added that did not
 obtain the booking via `findByIdForUpdate`, this entry is void and the mechanism
 must be redesigned, not patched.
+
+---
+
+<a id="dd-034"></a>
+### DD-034 — Settlement is deduped twice, because FR-22's key alone is not enough
+
+Date: 2026-09-05 · Author: Phase 1b · Phase: 1 · Requirements: FR-22, FR-23, FR-54, FR-55, INV-2, INV-3
+Supersedes: —
+
+**Context.**
+
+FR-22 requires webhook handling to be idempotent on `(payment_id, event_type)`, and
+§10.3 gives `payment_events` that unique key. FR-55 double-delivers 5% of webhooks
+on purpose, so this is a designed-for case and T-C5 tests it directly.
+
+Building the settlement path showed the requirement is **necessary but not
+sufficient in the presence of its neighbour**. FR-23 adds a reconciliation poll —
+a second, independent route to the same settlement. A poll carries no event, so it
+shares no key with a webhook, and the unique key cannot dedupe the two against each
+other. Both would settle, and `ledger_entries` would carry two `CHARGE` rows for
+one capture, which is INV-2's definition of a double charge.
+
+**Decision.**
+
+Two layers, with different jobs:
+
+1. **`payment_events` unique key**, insert-first. Stops the *same event* twice.
+   This is FR-22 as written.
+2. **A compare-and-set on `payments.status`** from `INITIATED` to a terminal value.
+   Stops *any* second settlement, whichever route it arrived by. Both routes must
+   pass through it.
+
+And a deliberate asymmetry between the routes: **webhooks dedupe on events;
+reconciliation dedupes on state and never reads the event table.**
+
+That asymmetry is load-bearing rather than stylistic. A crash between the settle
+commit and confirmation leaves the payment `SUCCESS`, the booking still
+`PAYMENT_PENDING`, and the `PAYMENT_SUCCEEDED` event row already written. An
+event-driven sweep would read "already handled" and skip it, stranding a captured
+payment on a booking that never advanced — permanently, and precisely INV-3's
+violation. Selecting by state instead makes the sweep the repair for that case.
+
+**Alternatives considered.**
+
+1. **Rejected — FR-22's key alone, on the grounds that the spec asks for nothing
+   more.** The spec is right about what it requires and silent about the
+   interaction. Two `CHARGE` rows is not a rounding error; it is the failure INV-2
+   exists to detect, and it would appear only when a webhook was slow enough for
+   the sweep to overlap it — which is exactly the condition chaos C5 creates on
+   purpose.
+
+2. **Rejected — dedupe on a hash of the webhook payload.** Attractive because it
+   needs no agreement with the provider about identity. It breaks the first time a
+   PSP adds a field, reorders JSON keys, or changes a timestamp format, and it
+   breaks *silently*, as a double settlement rather than an error. The tuple is the
+   identity; the payload is data, and this codebase stores it for audit only.
+
+3. **Rejected — have reconciliation write a `payment_events` row and rely on the
+   unique key for both routes.** This unifies the mechanism and reintroduces the
+   crash-repair hole above: the sweep would decline to repair precisely the state it
+   exists to repair. It also makes the audit trail claim the PSP sent an event it
+   never sent.
+
+**Consequences.**
+
+`payment_events.event_type` stores one of our own enum names, never the provider's
+string. A provider renaming `payment.succeeded` to `payment_succeeded` would
+otherwise open a fresh dedup bucket and the same event would settle twice; mapping
+at the edge keeps the key ours, and an unrecognised type is rejected at the edge
+rather than silently admitted.
+
+The `CHARGE` ledger entry is written at settlement, where the money moved — not at
+confirmation. Written at confirmation, an FR-24 `HOLD_EXPIRED` refund would produce
+a `REFUND` entry with no matching `CHARGE`, and INV-2 could not balance the ledger.
+
+Mutation testing found a weak test rather than a weak implementation. Removing the
+compare-and-set left `aPollAndAWebhookCannotBothSettleTheSamePayment` green,
+because the sweep's `PAYMENT_PENDING` filter had already excluded the settled
+booking and the CAS was never reached. The test's name claimed more than it
+demonstrated. Reversing the order — sweep first, webhook second — puts the CAS
+genuinely in the path, since the sweep writes no event for layer one to catch.
+
+**What would change this.**
+
+If a third settlement route is ever added — a Kafka consumer applying settlements
+from a partition owner, say — the two layers must be re-examined rather than
+assumed to extend. The falsifiable form: if any code path sets
+`payments.status` to a terminal value without going through the compare-and-set,
+this entry is void. An INV-2 check that counts `CHARGE` entries per payment and
+asserts at most one is the cheapest way to detect that it has happened.
 
 ---
 
