@@ -63,6 +63,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-030](#dd-030) | TATKAL pool size is FR-9's, not a number I chose | 0 |
 | [DD-031](#dd-031) | Strategy A needs three Redis keys §10.5 does not list | 1 |
 | [DD-032](#dd-032) | A PNR is issued at confirmation, and V4 said otherwise | 1 |
+| [DD-033](#dd-033) | A duplicate confirmation is caught before the insert, not after | 1 |
 
 ---
 
@@ -1848,6 +1849,97 @@ If RAC or WL bookings turn out to need a PNR before confirmation — FR-40 says 
 are "still paid bookings with PNRs", and Phase 3a will settle whether their
 lifecycle differs — the biconditional needs a third state on the PNR side, and
 this entry is superseded rather than edited.
+
+---
+
+<a id="dd-033"></a>
+### DD-033 — A duplicate confirmation is caught before the insert, not after
+
+Date: 2026-09-05 · Author: Phase 1b · Phase: 1 · Requirements: FR-22, FR-23, FR-25, INV-11, NFR-9
+Supersedes: —
+
+**Context.**
+
+FR-25's whole value is that a trip of `no_overlapping_allocations` at confirmation
+time carries exactly one meaning: an allocator sold one berth twice. INV-11 fails
+the entire run on a single such refund, and NFR-9 treats it as evidence that a bug
+shipped.
+
+Building the confirmation path surfaced a way for that signal to lie. FR-22's
+webhook and FR-23's reconciliation poll are two independent routes to the same
+settlement and can arrive together. If both proceed, the second `seat_allocations`
+insert overlaps **the first one's own rows** — same schedule, same berth, same
+range. The constraint fires, and a concurrency defect in our own code reports
+itself as an allocator defect, at the moment the run is being judged.
+
+**Decision.**
+
+Two mechanisms, in this order:
+
+1. `ConfirmBooking` loads the booking with `SELECT ... FOR UPDATE`, so the two
+   routes serialise on the booking row rather than racing to the constraint.
+2. `persistAllocations` queries for this booking's existing rows **before**
+   inserting, and reports `AlreadyPresent` if it finds any.
+
+The second is check-then-act, which this project has rejected elsewhere (DD-009,
+and the `IdempotencyStore` insert-first rule). It is admissible here only because
+the caller holds the row lock; without it, the check is a race. That dependency is
+stated in the port's contract, because the lock and the check are one mechanism
+split across two files and removing either silently breaks the other.
+
+**Alternatives considered.**
+
+1. **Rejected — `UNIQUE (booking_id, berth_id)` on `seat_allocations`, so the duplicate
+   surfaces as SQLState `23505` rather than `23P01`.** This was written as
+   migration V9, and then **measured and removed**. Postgres checks indexes in OID
+   order; V5's GiST index is older, so it reports first and the unique key never
+   fires. `SchemaMigrationTest` now pins the actual behaviour — a booking's own
+   duplicate raises `no_overlapping_allocations`, byte-for-byte what an allocator
+   defect raises.
+
+   Two lessons kept, beyond the immediate one. Which constraint wins is an artefact
+   of creation order and appears in no contract, so no correctness property may
+   rest on it. And the constraint was inert regardless: a booking has one schedule
+   and one segment range, so the exclusion constraint already implies the unique
+   key — it would have cost writes on the busiest table in the system and bought
+   nothing. The rationale was written before it was tested, and the test disagreed.
+
+2. **Rejected — rely on the row lock alone and let the constraint catch anything
+   that escapes.** Because what escapes is precisely the case that must not be
+   misread. A lock that is removed in a later refactor — or bypassed by a new
+   settlement route, which Phase 2's admission controller could easily add — would
+   turn a latent bug into a false accusation against the allocator, and the run
+   would fail pointing at the wrong component.
+
+3. **Rejected — make the confirmation path tolerant: catch the conflict, check
+   whether the rows belong to this booking, and continue if so.** Because it puts the
+   interpretation *after* the failure, which is the same shape FR-25 forbids for
+   steps 1 and 2. It also requires a `SAVEPOINT` dance to un-poison the transaction
+   before the diagnostic query can run, so the "simpler" option is not simpler.
+
+**Consequences.**
+
+`BookingRepository.persistAllocations` carries a two-part implementor contract:
+check before inserting, and return violations rather than throwing them (the
+`SAVEPOINT` requirement). Both are properties the JDBC adapter must honour and
+neither is expressible in the Java type system, so both are asserted in the
+adapter's own tests when it lands.
+
+`SchemaMigrationTest`'s fixture now seeds three bookings rather than reusing one
+for every row. That was needed to model "two customers share one berth on disjoint
+legs" honestly — the old fixture expressed T-3 as *one* booking allocating *one*
+berth twice, which cannot happen and was never what the test meant. The scaffolding
+had been loose since Phase 0; investigating this decision is what exposed it.
+
+**What would change this.**
+
+If Phase 2 adds a settlement route that cannot take the booking row lock — a
+partition-owner path that settles from a Kafka consumer without a Postgres
+transaction, say — the check-then-act loses its justification and must be replaced
+by something that does not depend on a lock the caller may not hold. The
+falsifiable form: if any caller of `persistAllocations` is ever added that did not
+obtain the booking via `findByIdForUpdate`, this entry is void and the mechanism
+must be redesigned, not patched.
 
 ---
 

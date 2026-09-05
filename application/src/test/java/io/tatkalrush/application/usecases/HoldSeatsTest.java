@@ -479,6 +479,32 @@ class HoldSeatsTest {
         public int countActiveHolds(long userId, Instant now) {
             return activeHolds;
         }
+
+        // The confirmation path (FR-24, FR-25). Unreachable from the hold path,
+        // and left unimplemented rather than faked: a fake here would be dead
+        // code that quietly starts being exercised if HoldSeats ever grows a
+        // dependency on it, which is exactly the change that should be noticed.
+
+        @Override
+        public Optional<BookingView> findByIdForUpdate(long bookingId) {
+            throw new UnsupportedOperationException("not part of the hold path");
+        }
+
+        @Override
+        public AllocationOutcome persistAllocations(
+                long bookingId, long scheduleId, SegmentRange range, List<Long> berthIds) {
+            throw new UnsupportedOperationException("not part of the hold path");
+        }
+
+        @Override
+        public boolean confirm(long bookingId, String pnr, Instant confirmedAt) {
+            throw new UnsupportedOperationException("not part of the hold path");
+        }
+
+        @Override
+        public boolean markFailedRefunded(long bookingId, Instant at) {
+            throw new UnsupportedOperationException("not part of the hold path");
+        }
     }
 
     private static final class FakeScheduleQuery implements ScheduleQuery {

@@ -164,11 +164,11 @@ class SchemaMigrationTest {
     void overlappingAllocationsAreRejected() throws SQLException {
         seedMinimalBooking();
 
-        allocate(1, 1, "[0,3)"); // Delhi -> Ratlam
+        allocate(1, 1, 1, "[0,3)"); // booking 1: Delhi -> Ratlam
 
         // [1,4) shares segments 1 and 2 with [0,3). Overbooking, and the
         // database must refuse it regardless of what the allocator believed.
-        SQLException e = assertThrows(SQLException.class, () -> allocate(1, 1, "[1,4)"));
+        SQLException e = assertThrows(SQLException.class, () -> allocate(2, 1, 1, "[1,4)"));
 
         assertTrue(
                 e.getMessage().contains("no_overlapping_allocations"),
@@ -183,8 +183,8 @@ class SchemaMigrationTest {
 
         // Half-open ranges meeting at segment 2: Delhi->Ratlam and Ratlam->Mumbai.
         // They share the stop, not a leg.
-        allocate(1, 1, "[0,2)");
-        allocate(1, 1, "[2,4)");
+        allocate(1, 1, 1, "[0,2)");
+        allocate(2, 1, 1, "[2,4)");
 
         assertEquals(
                 2,
@@ -198,8 +198,8 @@ class SchemaMigrationTest {
     @DisplayName("identical ranges on the same berth collide - the last-berth race, T-1")
     void identicalRangesCollide() throws SQLException {
         seedMinimalBooking();
-        allocate(1, 1, "[0,4)");
-        assertThrows(SQLException.class, () -> allocate(1, 1, "[0,4)"));
+        allocate(1, 1, 1, "[0,4)");
+        assertThrows(SQLException.class, () -> allocate(2, 1, 1, "[0,4)"));
     }
 
     @Test
@@ -207,9 +207,9 @@ class SchemaMigrationTest {
     void differentBerthOrScheduleDoesNotCollide() throws SQLException {
         seedMinimalBooking();
 
-        allocate(1, 1, "[0,4)");
-        allocate(1, 2, "[0,4)"); // same schedule, different berth
-        allocate(2, 1, "[0,4)"); // same berth, different journey date
+        allocate(1, 1, 1, "[0,4)");
+        allocate(1, 1, 2, "[0,4)"); // same booking, its second passenger
+        allocate(3, 2, 1, "[0,4)"); // same berth, different journey date
 
         assertEquals(3, allocationCount());
     }
@@ -222,20 +222,96 @@ class SchemaMigrationTest {
         // isempty('[2,2)') is true, and an empty range overlaps NOTHING - so
         // without the seg_range_is_non_empty CHECK these would insert freely and
         // record allocations that occupy no segments at all.
-        SQLException e = assertThrows(SQLException.class, () -> allocate(1, 1, "[2,2)"));
+        SQLException e = assertThrows(SQLException.class, () -> allocate(1, 1, 1, "[2,2)"));
         assertTrue(
                 e.getMessage().contains("seg_range_is_non_empty"),
                 "expected the non-empty CHECK to fire, got: " + e.getMessage());
     }
 
+    /**
+     * The finding that shaped {@code ConfirmBooking}: <b>the database cannot tell
+     * a duplicate confirmation from an allocator defect</b>, so the application
+     * must not wait to be told.
+     */
+    @Test
+    @DisplayName("a booking's OWN duplicate row is indistinguishable from a double-allocation")
+    void aBookingsOwnDuplicateLooksExactlyLikeAnAllocatorDefect() throws SQLException {
+        seedMinimalBooking();
+
+        allocate(1, 1, 1, "[0,4)");
+
+        // The same booking, the same berth, again - what a duplicate confirmation
+        // produces if FR-22's webhook and FR-23's poll both get past the row lock.
+        SQLException e = assertThrows(SQLException.class, () -> allocate(1, 1, 1, "[0,4)"));
+
+        assertEquals(
+                "23P01",
+                e.getSQLState(),
+                "expected an exclusion violation, got SQLSTATE " + e.getSQLState());
+        assertTrue(
+                e.getMessage().contains("no_overlapping_allocations"),
+                "got: " + e.getMessage());
+
+        // Read that assertion again: a booking confirmed twice reports the SAME
+        // error as an allocator selling one berth to two customers. Under FR-25
+        // that error means "an allocator bug shipped", fails the run under INV-11,
+        // and sends the investigation to the wrong component.
+        //
+        // A UNIQUE (booking_id, berth_id) key was tried and removed. It does not
+        // help: Postgres checks indexes in OID order, so V5's older GiST index
+        // reports first and the unique key never fires. Which constraint wins is
+        // an artefact of creation order and is not part of any contract - not a
+        // foundation for a correctness property.
+        //
+        // So ConfirmBooking holds the booking's row lock and checks for its own
+        // existing rows BEFORE inserting. Check-then-act, made safe by the lock
+        // rather than by hope. See BookingRepository#persistAllocations.
+    }
+
+    @Test
+    @DisplayName("RefundReason and the refunds.reason CHECK constraint cannot drift apart")
+    void refundReasonEnumMatchesTheCheckConstraint() throws SQLException {
+        // The enum is the application's opinion; the CHECK is the database's.
+        // Adding a value to one and not the other produces a runtime insert
+        // failure on a path that only runs during a chaos scenario - which is to
+        // say, in the least convenient place to discover it.
+        String definition =
+                queryString(
+                        "SELECT pg_get_constraintdef(oid) FROM pg_constraint"
+                            + " WHERE conname = 'refunds_reason_check'");
+
+        for (io.tatkalrush.domain.pricing.RefundReason reason :
+                io.tatkalrush.domain.pricing.RefundReason.values()) {
+            assertTrue(
+                    definition.contains("'" + reason.name() + "'"),
+                    "RefundReason." + reason + " is not admitted by refunds_reason_check: "
+                            + definition);
+        }
+
+        // And the other direction: a value in SQL with no enum constant would be
+        // unreachable from the application and silently dead.
+        long quoted = definition.chars().filter(c -> c == '\'').count() / 2;
+        assertEquals(
+                io.tatkalrush.domain.pricing.RefundReason.values().length,
+                quoted,
+                "the CHECK admits values RefundReason does not name: " + definition);
+    }
+
     // ----------------------------------------------------------- helpers
 
-    private void allocate(long scheduleId, long berthId, String range) throws SQLException {
+    /**
+     * @param bookingId which booking owns the row. Explicit since V9, because
+     *     {@code UNIQUE (booking_id, berth_id)} makes "one booking, one berth,
+     *     twice" a different event from "two bookings, one berth" — and every
+     *     scenario below is really about the second.
+     */
+    private void allocate(long bookingId, long scheduleId, long berthId, String range)
+            throws SQLException {
         try (Statement st = connection.createStatement()) {
             st.execute(
                     "INSERT INTO seat_allocations (schedule_id, berth_id, booking_id, seg_range)"
-                            + " VALUES (%d, %d, 1, '%s'::int4range)"
-                                    .formatted(scheduleId, berthId, range));
+                            + " VALUES (%d, %d, %d, '%s'::int4range)"
+                                    .formatted(scheduleId, berthId, bookingId, range));
         }
     }
 
@@ -272,10 +348,18 @@ class SchemaMigrationTest {
             // that a HELD booking has none. This insert carried 'PNR0000001'
             // until V8 landed and rejected it - the constraint catching a
             // fixture that had been quietly wrong since Phase 0.
+            // Three bookings, not one. Since V9 a booking holds a given berth at
+            // most once, so scenarios about two customers competing for (or
+            // sharing) a berth need two customers to be modelled as two
+            // bookings. The old fixture reused booking 1 for every row, which
+            // made T-3 read as "one booking allocated one berth twice" - a thing
+            // that cannot happen and was never what the test meant.
             st.execute(
                     "INSERT INTO bookings (schedule_id, travel_class, quota_type, from_seq,"
                         + " to_seq, status, booking_class, passenger_count, fare_paise, user_id)"
-                        + " VALUES (1,'SL','TATKAL',0,4,'HELD','CNF',1,145000,1)");
+                        + " VALUES (1,'SL','TATKAL',0,4,'HELD','CNF',1,145000,1),"
+                        + "        (1,'SL','GENERAL',2,4,'HELD','CNF',1,145000,1),"
+                        + "        (2,'SL','GENERAL',0,4,'HELD','CNF',1,145000,1)");
         }
     }
 
@@ -290,6 +374,14 @@ class SchemaMigrationTest {
                 ResultSet rs = st.executeQuery(sql)) {
             rs.next();
             return rs.getBoolean(1);
+        }
+    }
+
+    private String queryString(String sql) throws SQLException {
+        try (Statement st = connection.createStatement();
+                ResultSet rs = st.executeQuery(sql)) {
+            assertTrue(rs.next(), "no row for: " + sql);
+            return rs.getString(1);
         }
     }
 
