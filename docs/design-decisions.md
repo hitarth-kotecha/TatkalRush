@@ -65,6 +65,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-032](#dd-032) | A PNR is issued at confirmation, and V4 said otherwise | 1 |
 | [DD-033](#dd-033) | A duplicate confirmation is caught before the insert, not after | 1 |
 | [DD-034](#dd-034) | Settlement is deduped twice, because FR-22's key alone is not enough | 1 |
+| [DD-035](#dd-035) | A correct outcome that must not persist needs a rollback that is not an exception | 1 |
 
 ---
 
@@ -2031,6 +2032,94 @@ assumed to extend. The falsifiable form: if any code path sets
 `payments.status` to a terminal value without going through the compare-and-set,
 this entry is void. An INV-2 check that counts `CHARGE` entries per payment and
 asserts at most one is the cheapest way to detect that it has happened.
+
+---
+
+<a id="dd-035"></a>
+### DD-035 — A correct outcome that must not persist needs a rollback that is not an exception
+
+Date: 2026-09-05 · Author: Phase 1b · Phase: 1 · Requirements: FR-19, FR-20, FR-29, FR-51, NFR-7
+Supersedes: —
+
+**Context.**
+
+`HoldSeats` carried a comment asserting that returning `SEAT_UNAVAILABLE` rolled
+the transaction back, and that the rollback was what released the idempotency
+claim so a client could retry the same key against a train that had since freed a
+berth.
+
+`UnitOfWork` said the opposite: "committing on normal return, and rolling back on
+any exception." Writing the Spring adapter is what forced the two into the same
+sentence. Under the port as written, `SEAT_UNAVAILABLE` **commits the claim** and
+the key is burnt permanently — every retry a 409, forever.
+
+The test that was supposed to cover this passed. `HoldSeatsTest`'s
+`DirectUnitOfWork` had a private `isRollbackOutcome` method that inspected the
+returned value's type and rolled back for three of them. Nothing in the port asked
+for that. The fake had invented the behaviour the production adapter lacked, so
+the test proved only that the fake agreed with itself.
+
+**Decision.**
+
+An overload: `inTransaction(Supplier<T> work, Predicate<T> rollbackIf)`. The work
+still returns its value to the caller; only the transaction is discarded. Which
+outcomes qualify lives in one named, documented method on the use case —
+`HoldSeats.mustNotPersist` — because "which answers must leave no trace" is a
+policy of the use case, not of the transaction manager.
+
+Three outcomes qualify: `SEAT_UNAVAILABLE` (FR-51), `QUOTA_LOCKED` (FR-29) and
+`TOO_MANY_HOLDS` (FR-20). All three consumed a claim of our own and then declined
+to produce a booking. The claim outcomes are deliberately absent — `Reused`,
+`RetryLater` and `DuplicateRequest` all mean we did not win the claim, so there is
+nothing of ours to release.
+
+**Alternatives considered.**
+
+1. **Rejected — throw a control-flow exception for these outcomes.** It is the
+   smallest change and it is wrong twice over. FR-51 states in as many words that
+   `SEAT_UNAVAILABLE` is "a correct outcome, not an error", so this contradicts a
+   requirement in order to satisfy a framework's convention. Worse, FR-51 also
+   excludes it from NFR-7's error budget, and an outcome that arrives as an
+   exception is exactly the one that gets counted as an error by whatever wraps it
+   next — quietly making a benchmark fail on correct behaviour.
+
+2. **Rejected — a sealed `Outcome<T>` of `Commit` and `Rollback`.** Type-safe, and
+   impossible to forget, which is attractive given the bug was a forgotten
+   contract. It forces wrapping at all eight `inTransaction` call sites, six of
+   which always commit, and it scatters the policy across ten `return` statements
+   inside `holdWithinTransaction` rather than stating it once where it can be read
+   and argued with.
+
+3. **Rejected — a `markRollbackOnly()` method on the port, mirroring Spring's
+   own.** The standard idiom, and the least churn. It is action at a distance: the
+   call and its effect are in different places, and forgetting it fails silently
+   in exactly the way this entry exists to prevent.
+
+**Consequences.**
+
+`SpringUnitOfWork` calls `status.setRollbackOnly()`, and
+`JdbcBookingRepositoryTest` asserts against real Postgres that the caller still
+receives its answer while the work is gone. Removing that one line turns the test
+red with `expected: <HELD> but was: <PAYMENT_PENDING>`, which is the bug reproduced.
+
+`DirectUnitOfWork` now implements the port and only the port.
+
+**This is the second fake in two increments to be more permissive than its port.**
+The payment fake ignored booking status where `findPendingSettlements` selects
+`PAYMENT_PENDING` bookings; this one invented a rollback rule. Both made a test
+green against behaviour no adapter had. The pattern is worth naming: a fake is a
+second implementation of the port, and an implementation that is more capable than
+its interface promises will always flatter the code under test. Writing the real
+adapter is what catches it, which is an argument for writing adapters earlier than
+strictly necessary rather than last.
+
+**What would change this.**
+
+If a use case ever needs to roll back on something other than the returned value —
+a count of side effects, or a condition known only mid-work — the predicate is the
+wrong shape and alternative 2 or 3 becomes correct. The falsifiable form: if any
+caller has to contort its return type to make `rollbackIf` expressible, this entry
+is void.
 
 ---
 

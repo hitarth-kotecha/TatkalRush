@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -392,13 +393,23 @@ class HoldSeatsTest {
     // ------------------------------------------------------------------ fakes
 
     /** Runs work directly; rollback is simulated by the store's own bookkeeping. */
+    /**
+     * Runs work inline, honouring the port's contract and <b>only</b> the port's
+     * contract.
+     *
+     * <p>An earlier version decided for itself which return values meant rollback,
+     * by inspecting their types. That made {@code unavailableReleasesKey} pass
+     * against behaviour no production adapter had: {@link UnitOfWork} committed on
+     * normal return, so SEAT_UNAVAILABLE would have burnt the key. A fake that
+     * invents semantics tests the fake.
+     */
     private final class DirectUnitOfWork implements UnitOfWork {
         @Override
-        public <T> T inTransaction(Supplier<T> work) {
+        public <T> T inTransaction(Supplier<T> work, Predicate<T> rollbackIf) {
             idempotency.beginTransaction();
             try {
                 T result = work.get();
-                if (isRollbackOutcome(result)) {
+                if (rollbackIf.test(result)) {
                     idempotency.rollback();
                 } else {
                     idempotency.commit();
@@ -408,16 +419,6 @@ class HoldSeatsTest {
                 idempotency.rollback();
                 throw e;
             }
-        }
-
-        /**
-         * A rejection returned rather than thrown still rolls back — which is how
-         * SEAT_UNAVAILABLE leaves the idempotency key reusable instead of burnt.
-         */
-        private boolean isRollbackOutcome(Object result) {
-            return result instanceof Result.SeatUnavailable
-                    || result instanceof Result.TooManyHolds
-                    || result instanceof Result.QuotaLocked;
         }
     }
 

@@ -106,7 +106,28 @@ public final class HoldSeats {
             return new Result.InvalidRange(command.range(), descriptor.segmentCount());
         }
 
-        return unitOfWork.inTransaction(() -> holdWithinTransaction(command, descriptor));
+        return unitOfWork.inTransaction(
+                () -> holdWithinTransaction(command, descriptor), HoldSeats::mustNotPersist);
+    }
+
+    /**
+     * Correct outcomes that must nonetheless leave no trace.
+     *
+     * <p>All three consumed an idempotency claim of our own and then declined to
+     * produce a booking. The rollback is what releases that claim, so the client
+     * may retry with the <em>same</em> key — against a train that has since freed a
+     * berth (FR-51), once the Tatkal window opens (FR-29), or after one of its own
+     * holds expires (FR-20). Committing any of them burns the key permanently and
+     * turns a temporary "not now" into a permanent 409.
+     *
+     * <p>The claim outcomes are deliberately absent. {@code Reused},
+     * {@code RetryLater} and {@code DuplicateRequest} all mean we did <em>not</em>
+     * win the claim, so there is nothing of ours to release.
+     */
+    private static boolean mustNotPersist(Result result) {
+        return result instanceof Result.SeatUnavailable
+                || result instanceof Result.QuotaLocked
+                || result instanceof Result.TooManyHolds;
     }
 
     private Result holdWithinTransaction(

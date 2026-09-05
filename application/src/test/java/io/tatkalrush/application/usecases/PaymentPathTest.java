@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -524,12 +525,12 @@ class PaymentPathTest {
         }
 
         @Override
-        public <T> T inTransaction(Supplier<T> work) {
+        public <T> T inTransaction(Supplier<T> work, Predicate<T> rollbackIf) {
             depth++;
             calls.add("tx.begin");
             try {
                 T result = work.get();
-                calls.add("tx.commit");
+                calls.add(rollbackIf.test(result) ? "tx.rollback" : "tx.commit");
                 return result;
             } finally {
                 depth--;

@@ -29,12 +29,6 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-jdbc</artifactId>
     </dependency>
-    <!-- The IdempotencyStore port this module implements (FR-19). -->
-    <dependency>
-      <groupId>io.tatkalrush</groupId>
-      <artifactId>application</artifactId>
-      <version>${project.version}</version>
-    </dependency>
     <!--
       Spring Boot 4 split spring-boot-autoconfigure into per-technology modules.
       FlywayAutoConfiguration lived in spring-boot-autoconfigure through 3.x; in
