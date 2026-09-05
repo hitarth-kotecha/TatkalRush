@@ -50,6 +50,26 @@ import java.time.Instant;
  * and changes nothing. The event is still recorded, because the audit trail should
  * show what the PSP said even when it said it too late.
  *
+ * <h2>Known: the sweep is not partitioned between replicas</h2>
+ *
+ * <p>§8.3's stack runs two application instances, and both will run this sweep.
+ * They will select the same rows. That is <b>safe but wasteful</b>: settlement is
+ * a compare-and-set and confirmation takes the booking's row lock, so the second
+ * replica settles nothing and confirms nothing — but it does call
+ * {@link PaymentGateway#poll} for every payment the first one already handled,
+ * doubling PSP load precisely during chaos C5, which is when the sweep has the
+ * most to do and when its cost is being measured.
+ *
+ * <p>Not fixed here because the obvious fix does not fit the shape.
+ * {@code FOR UPDATE SKIP LOCKED} partitions a queue between workers by holding the
+ * lock for the length of the processing — and the processing here calls the PSP,
+ * which must never happen inside a transaction. Doing it properly means claiming
+ * rows in a short transaction (stamping a {@code last_reconciled_at}), committing,
+ * and processing outside, which needs a column and a migration.
+ *
+ * <p>Recorded rather than done, because it is a cost, not a defect, and because
+ * measuring it during P2 is a better basis for the design than guessing at it now.
+ *
  * <h2>Where the HMAC check is not</h2>
  *
  * <p>FR-61's signature covers the raw request bytes and must be verified before

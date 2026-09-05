@@ -2129,6 +2129,7 @@ is void.
 |---|---|---|---|
 | OQ-2 | What throughput does the build machine sustain? | 2026-09-04 | **RESOLVED** 2026-09-04 — 750 rps no-I/O. See [DD-029](#dd-029). The question of whether that is *enough for §9.4* moved to AC-1.13 |
 | OQ-3 | Is `app/` the right composition root? It is not in §8.2's module tree; Phase 0 added it rather than guess silently | 2026-09-04 | **OPEN** — author to confirm or relocate. See [DD-023](#dd-023) |
+| OQ-4 | FR-23's reconciliation sweep is not partitioned between the two app replicas. Both examine the same rows — safe (settlement is a compare-and-set, confirmation takes a row lock) but it doubles PSP polling during a sweep, which is exactly when chaos C5 is measuring that cost | 2026-09-05 | **OPEN** — `FOR UPDATE SKIP LOCKED` does not fit, because it holds the lock across processing and the processing calls the PSP. Doing it properly means claiming rows in a short transaction (a `last_reconciled_at` stamp), committing, then processing outside — a column and a migration. Deferred until P2 measures whether it matters |
 
 OQ-1 (calendar budget) was resolved on 2026-09-04: Phase 3 is in scope. See [DD-018](#dd-018).
 
