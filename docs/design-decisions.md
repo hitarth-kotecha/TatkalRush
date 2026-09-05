@@ -66,6 +66,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-033](#dd-033) | A duplicate confirmation is caught before the insert, not after | 1 |
 | [DD-034](#dd-034) | Settlement is deduped twice, because FR-22's key alone is not enough | 1 |
 | [DD-035](#dd-035) | A correct outcome that must not persist needs a rollback that is not an exception | 1 |
+| [DD-036](#dd-036) | The PSP draws its verdict once, at charge time | 1 |
 
 ---
 
@@ -2120,6 +2121,90 @@ a count of side effects, or a condition known only mid-work — the predicate is
 wrong shape and alternative 2 or 3 becomes correct. The falsifiable form: if any
 caller has to contort its return type to make `rollbackIf` expressible, this entry
 is void.
+
+---
+
+<a id="dd-036"></a>
+### DD-036 — The PSP draws its verdict once, at charge time
+
+Date: 2026-09-05 · Author: Phase 1b · Phase: 1 · Requirements: FR-23, FR-24, FR-50, FR-52 to FR-57
+Supersedes: —
+
+**Context.**
+
+§12's simulator is an instrument, not a stub. The failures FR-22, FR-23 and FR-24
+are written against — a webhook that never arrives, a success landing after the
+hold expired, the same webhook twice — are exactly the ones a real payment
+processor will not produce on request, so the only way to test the code that
+handles them is to own the thing that causes them.
+
+That makes the simulator's own consistency a correctness property. It has two
+questions to answer about every payment: what did it decide, and did anyone hear.
+FR-23's poll and FR-22's webhook must never disagree about the first.
+
+**Decision.**
+
+The outcome and the settlement delay are drawn **once, when the charge arrives**,
+and stored on the payment. Every later answer — the webhook body, the poll
+response, whether a refund is permitted — reads that stored verdict.
+
+`charge` is idempotent on the reference (the caller's own idempotency key), so a
+retried charge returns the existing payment rather than drawing again.
+
+The four FR-54 outcomes are modelled as two independent facts, *captured* and
+*delivery*. `LATE_SUCCESS` and `NO_WEBHOOK` both capture money; only their delivery
+is broken.
+
+**Alternatives considered.**
+
+1. **Rejected — draw the outcome at delivery time.** Simpler, and it lets a poll
+   answer `SUCCESS` while the webhook says `FAILED`. That is not a scenario worth
+   reproducing; it is a PSP contradicting itself, and it would send an
+   investigation into `SettlePayment` looking for a bug that is in the instrument.
+   The simulator must be more trustworthy than the code it tests, or a failing run
+   proves nothing.
+
+2. **Rejected — make `LATE_SUCCESS` and `NO_WEBHOOK` payment failures.** The
+   natural reading of "timeout" and "never sent" as things that went wrong. It
+   makes the simulator look like it exercises FR-23 and FR-24 while exercising
+   neither: a failed payment has nothing to refund under FR-24 and nothing to
+   recover under FR-23. Two mutation tests exist purely to keep this from being
+   re-introduced.
+
+3. **Rejected — a per-reference derived seed, for full per-payment determinism.**
+   Genuinely stronger than what is built, and not needed. See below for what the
+   single seed does and does not buy.
+
+**Consequences.**
+
+The latency distribution is log-normal with parameters **solved from the median and
+p99** rather than hardcoded as μ and σ, so FR-56 can be given the two numbers an
+operator can reason about. A p99 below the median is refused at construction: it
+yields a negative σ, which inverts the distribution so the slow tail becomes a fast
+one — the simulator would look well-behaved under exactly the configuration meant
+to stress it.
+
+**Be precise about what the seed buys.** Charges arrive concurrently and consume
+draws in whatever order threads interleave, so the same payment does *not* receive
+the same verdict across two runs. What is reproducible is the **distribution** —
+roughly the same proportion of late successes and silent settlements, from the same
+stream. That is what §9.4's comparison needs, and claiming per-payment determinism
+would be false. Alternative 3 is how to get it if a scenario ever needs it.
+
+One property here is **not test-detectable**: `WebhookSigner` uses
+`MessageDigest.isEqual` for constant-time comparison, and replacing it with
+`Arrays.equals` fails no test — a timing side channel does not make assertions go
+red. That is presumably why FR-61 names the requirement explicitly rather than
+leaving it to judgement, and it is the one thing in this file a reviewer has to
+check by reading.
+
+**What would change this.**
+
+If a chaos scenario ever needs a specific payment to receive a specific outcome —
+to reproduce a reported failure exactly, say — the single seed is insufficient and
+alternative 3 becomes necessary. The falsifiable form: if any test or scenario has
+to run the simulator single-threaded to get a repeatable result, the seeding
+strategy is wrong.
 
 ---
 
