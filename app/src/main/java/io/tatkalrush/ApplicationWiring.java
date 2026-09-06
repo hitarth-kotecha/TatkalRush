@@ -7,6 +7,7 @@ import io.lettuce.core.api.sync.RedisCommands;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.tatkalrush.adapters.allocatorredis.RedisSeatAllocator;
+import io.tatkalrush.admission.RedisRateLimiter;
 import io.tatkalrush.adapters.paymentsim.HttpPaymentGateway;
 import io.tatkalrush.adapters.paymentsim.WebhookSigner;
 import io.tatkalrush.adapters.persistence.JdbcBookingRepository;
@@ -23,6 +24,7 @@ import io.tatkalrush.application.ports.PaymentGateway;
 import io.tatkalrush.application.ports.PaymentReferences;
 import io.tatkalrush.application.ports.PaymentRepository;
 import io.tatkalrush.application.ports.PnrSequence;
+import io.tatkalrush.application.ports.RateLimiter;
 import io.tatkalrush.application.ports.ScheduleQuery;
 import io.tatkalrush.application.ports.SeatAllocator;
 import io.tatkalrush.application.ports.UnitOfWork;
@@ -135,6 +137,16 @@ public class ApplicationWiring {
     @Bean
     SeatAllocator seatAllocator(RedisCommands<String, String> redis) {
         return new RedisSeatAllocator(redis);
+    }
+
+    @Bean
+    RateLimiter rateLimiter(
+            RedisCommands<String, String> redis,
+            @Value("${tatkalrush.rate-limit.per-second:10}") int perSecond) {
+        // FR-60's 10 rps, as configuration. §19.5 makes a single rejection void a
+        // benchmark run, so an operator investigating a voided run needs to be able
+        // to see - and if genuinely wrong, change - the number that voided it.
+        return new RedisRateLimiter(redis, perSecond);
     }
 
     @Bean
