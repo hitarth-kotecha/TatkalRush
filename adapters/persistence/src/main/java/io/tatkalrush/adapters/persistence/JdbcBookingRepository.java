@@ -360,7 +360,8 @@ public final class JdbcBookingRepository implements BookingRepository {
                 jdbc.sql(
                                 """
                                 UPDATE bookings
-                                SET status = 'CANCELLED', cancelled_at = ?
+                                SET status = 'CANCELLED', cancelled_at = ?,
+                                    hold_expires_at = NULL
                                 WHERE id = ? AND status = 'CONFIRMED'
                                 """)
                         .param(Timestamp.from(at))
@@ -412,8 +413,18 @@ public final class JdbcBookingRepository implements BookingRepository {
         // WHERE clause below.
         from.requireTransitionTo(to);
 
+        // hold_expires_at is cleared on every transition into a TERMINAL state.
+        //
+        // Not tidiness: INV-10 asks whether a terminal booking still holds a berth,
+        // and a released hold that kept its expiry would answer yes for the rest of
+        // its original TTL. The check would fire on correct behaviour, and a check
+        // that does that gets disabled - along with the ones beside it.
+        String clause = to.isTerminal() ? ", hold_expires_at = NULL" : "";
+
         int updated =
-                jdbc.sql("UPDATE bookings SET status = ? WHERE id = ? AND status = ?")
+                jdbc.sql(
+                                "UPDATE bookings SET status = ?%s WHERE id = ? AND status = ?"
+                                        .formatted(clause))
                         .param(to.name())
                         .param(bookingId)
                         .param(from.name())
