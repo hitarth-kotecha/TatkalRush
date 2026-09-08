@@ -62,8 +62,22 @@
     </dependency>
     <dependency>
       <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
       <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
+    </dependency>
+    <!--
+      Lettuce, so INV-8 and INV-12 can read the RAW BYTES. Deliberately not a
+      dependency on adapters/allocator-redis: the checker must be able to
+      disagree with the allocator, and importing it would make that impossible.
+    -->
+    <dependency>
+      <groupId>io.lettuce</groupId>
+      <artifactId>lettuce-core</artifactId>
     </dependency>
   </dependencies>
 
