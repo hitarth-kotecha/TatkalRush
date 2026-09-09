@@ -6,6 +6,7 @@ import io.lettuce.core.api.StatefulRedisConnection;
 import io.lettuce.core.api.sync.RedisCommands;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.tatkalrush.adapters.allocatorredis.RedisAvailabilityCache;
 import io.tatkalrush.adapters.allocatorredis.RedisSeatAllocator;
 import io.tatkalrush.admission.RedisRateLimiter;
 import io.tatkalrush.adapters.paymentsim.HttpPaymentGateway;
@@ -15,8 +16,10 @@ import io.tatkalrush.adapters.persistence.JdbcIdempotencyStore;
 import io.tatkalrush.adapters.persistence.JdbcPaymentRepository;
 import io.tatkalrush.adapters.persistence.JdbcPnrSequence;
 import io.tatkalrush.adapters.persistence.JdbcScheduleQuery;
+import io.tatkalrush.adapters.persistence.JdbcTrainSearchQuery;
 import io.tatkalrush.adapters.persistence.SpringUnitOfWork;
 import io.tatkalrush.adapters.web.PaymentWebhookController;
+import io.tatkalrush.application.ports.AvailabilityCache;
 import io.tatkalrush.application.ports.BookingRepository;
 import io.tatkalrush.application.ports.IdempotencyStore;
 import io.tatkalrush.application.ports.IntegrityAlarm;
@@ -27,11 +30,13 @@ import io.tatkalrush.application.ports.PnrSequence;
 import io.tatkalrush.application.ports.RateLimiter;
 import io.tatkalrush.application.ports.ScheduleQuery;
 import io.tatkalrush.application.ports.SeatAllocator;
+import io.tatkalrush.application.ports.TrainSearchQuery;
 import io.tatkalrush.application.ports.UnitOfWork;
 import io.tatkalrush.application.usecases.CancelBooking;
 import io.tatkalrush.application.usecases.ConfirmBooking;
 import io.tatkalrush.application.usecases.HoldSeats;
 import io.tatkalrush.application.usecases.InitiatePayment;
+import io.tatkalrush.application.usecases.SearchTrains;
 import io.tatkalrush.application.usecases.SettlePayment;
 import java.time.Duration;
 import java.time.InstantSource;
@@ -117,6 +122,20 @@ public class ApplicationWiring {
     @Bean
     ScheduleQuery scheduleQuery(DataSource dataSource) {
         return new JdbcScheduleQuery(dataSource);
+    }
+
+    @Bean
+    TrainSearchQuery trainSearchQuery(DataSource dataSource) {
+        return new JdbcTrainSearchQuery(dataSource);
+    }
+
+    @Bean
+    AvailabilityCache availabilityCache(
+            RedisCommands<String, String> redis,
+            @Value("${tatkalrush.search.cache-ttl-ms:2000}") long ttlMillis) {
+        // FR-15's 2 s, as configuration: chaos scenario C2 wants it shorter to
+        // observe a rebuild, and a benchmark report has to record what it was.
+        return new RedisAvailabilityCache(redis, Duration.ofMillis(ttlMillis));
     }
 
     @Bean
@@ -248,6 +267,12 @@ public class ApplicationWiring {
             ScheduleQuery schedules,
             UnitOfWork unitOfWork) {
         return new CancelBooking(bookings, payments, gateway, allocator, schedules, unitOfWork);
+    }
+
+    @Bean
+    SearchTrains searchTrains(
+            TrainSearchQuery routes, SeatAllocator allocator, AvailabilityCache cache) {
+        return new SearchTrains(routes, allocator, cache);
     }
 
     @Bean

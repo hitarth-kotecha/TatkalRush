@@ -2284,6 +2284,139 @@ from the booking row, the argument above no longer holds and the signature is wr
 
 ---
 
+### DD-038 — FR-15 caches the number, not the response
+
+Date: 2026-09-09 · Author: Phase 1c · Phase: 1 · Requirements: FR-12, FR-13, FR-14, FR-15, NFR-5, INV-12
+Supersedes: —
+
+**Context.**
+
+API-1 carries nine tenths of P2's load, and FR-15 keys its cache
+`(train, date, from, to, class, pool)`. Read carefully, that key is exactly
+`PoolKey` plus `SegmentRange` — and it conspicuously does **not** include the list
+of trains, which is the part a naive implementation would cache.
+
+The two halves of a search response have completely different volatility. Which
+trains serve a route is reference data that does not change during a benchmark run.
+How many berths are free changes thousands of times a second.
+
+**Decision.**
+
+One entry per `(pool, range)`, holding a single integer, at
+`search:{<poolSuffix>}:<from>-<to>` with a 2 s TTL. Reads are one `MGET` for every
+pool on the route; misses go to `availability.lua` individually and are written
+back.
+
+The hot train everybody is searching is therefore **one** cache entry, hit by every
+query that touches it whatever station pair was asked about. That is where FR-15's
+"orders of magnitude" actually comes from.
+
+A miss is an **absent entry**, never a zero. Zero is a legitimate availability
+answer meaning sold out, so a cache that manufactured one from a missing key would
+report a full train as sold out and nothing above it could tell the difference.
+
+**Alternatives considered.**
+
+1. **Rejected — cache the whole search response under one key.** Fewer round trips
+   and a simpler adapter. It welds the stable half to the volatile half: the train
+   list would expire every 2 s along with the availability, and two searches sharing
+   a train would share nothing, so the hot train would be recomputed once per
+   distinct station pair instead of once per pool.
+
+2. **Rejected — no cache, compute exactly on every search.** Strongly consistent,
+   and FR-14 explicitly instructs the reviewer to treat that as a **defect**. It puts
+   nine tenths of the system's traffic onto the free-count structure the allocator
+   needs for correctness, so search would slow booking down and §9.4's comparison
+   would end up measuring the search path.
+
+3. **Rejected — pipeline async GETs with Lettuce auto-flush disabled.** The
+   documented batching idiom, and marginally better than `MGET` under Cluster. The
+   connection is a singleton shared by every request thread, so toggling a
+   connection-wide flag to speed up one request would reorder another's commands. A
+   shared-state race is a bad trade for a saved round trip.
+
+**Consequences.**
+
+`MGET` spans hash slots, which is correct on the single Redis node §8.3 specifies
+and would need a per-slot fan-out under Redis Cluster. The hash tags make that
+migration mechanical rather than a redesign, and it is recorded here rather than
+discovered later.
+
+Staleness is **bounded**; drift is not. A 2 s TTL means an answer is at most 2 s
+old, which is the bounded imprecision FR-14 licenses. It licenses nothing about the
+free counts themselves wandering from the masks they summarise — that has no bound,
+and INV-12 is what catches it. A cache cannot be blamed for a bookkeeping bug, and
+this distinction is the one a reader is most likely to collapse.
+
+A pool with no readable Redis state reports `availableBerths: null` rather than
+failing the whole search or fabricating a zero. That state is reachable in
+production: between a pool's creation in Postgres and its initialisation in Redis,
+and after chaos scenario C2's `FLUSHALL` until §13.4's rebuild completes. INV-8
+reports the same condition from the other direction.
+
+**What would change this.**
+
+The cache's value is an assumption until P2 measures it. Each response carries its
+own `cache.hits`/`cache.misses`, so the claim is falsifiable directly: **if the
+measured hit rate under P2 is below roughly 50%, the per-pool key is not collapsing
+read amplification and the granularity is wrong** — most likely because the profile
+spreads searches across more distinct `(pool, range)` pairs than the 2 s window can
+hold. Either the TTL rises or the key coarsens, and both are decisions to log.
+
+---
+
+### DD-039 — Search is authenticated and rate-limited
+
+Date: 2026-09-09 · Author: Phase 1c · Phase: 1 · Requirements: FR-12, FR-58, FR-59, FR-60, §19.5
+Supersedes: —
+
+**Context.**
+
+Real ticketing sites let anyone search without logging in. This one does not, and
+the reason is a load-testing constraint rather than a product one.
+
+§19.5 makes `rate_limited_total > 0` **void a benchmark run**, and §17 derives the
+harness sizing from FR-60's 10 rps cap: "P2's 2,000 rps needs ≥200 distinct users
+and P1's 5,000 rps needs ≥500". That arithmetic is only correct if searches count
+against the cap.
+
+**Decision.**
+
+`GET /api/v1/trains/search` sits behind `JwtAuthFilter` and inside
+`RateLimitFilter`, like every other business endpoint. The only exemptions stay the
+ones that already exist: `/actuator`, `/api/v1/auth/`, the PSP webhook and `/psp/`.
+
+**Alternatives considered.**
+
+1. **Rejected — leave search unauthenticated, as a real system would.** More
+   realistic, and it makes §19.5's validity gate wrong in the direction that hides a
+   problem: a P2 run could report a valid `rate_limited_total` of zero while nine
+   tenths of its traffic bypassed the limiter entirely. The number would be true and
+   would mean nothing.
+
+2. **Rejected — authenticate but exempt search from FR-60.** Keeps FR-59's user id
+   available for logging while letting the read path run unthrottled. It splits the
+   cap across two classes of request, so "10 rps per user" would no longer describe
+   what any user can do, and the harness sizing in §17 would need its own separate
+   derivation for reads.
+
+**Consequences.**
+
+Every k6 profile must obtain a token per virtual user before issuing any request,
+including the read-only ones. That is one extra call at ramp-up per VU, and P1's
+5,000 VUs make it a measurable startup cost that the profile has to absorb before
+the measurement window opens rather than inside it.
+
+**What would change this.**
+
+If §19.5's gate ever voids a run whose `RATE_LIMITED` responses are traceable to
+search volume rather than to an under-provisioned user table, the coupling has cost
+more than it bought. The falsifiable form: if a P2 run at the AC-1.13 rate voids
+with `rate_limited_total > 0` while holding ≥1 distinct user per VU, this decision
+is wrong and search needs its own bucket.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |
