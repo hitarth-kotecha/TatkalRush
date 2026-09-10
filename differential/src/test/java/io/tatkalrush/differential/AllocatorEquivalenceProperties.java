@@ -208,7 +208,13 @@ class AllocatorEquivalenceProperties {
         var pool =
                 new PoolKey(
                         NEXT_SCHEDULE.getAndIncrement(), TravelClass.SL, QuotaType.TATKAL);
-        redisAllocator.provision(pool, scenario.berths(), scenario.segments(), List.of());
+        // Held, because it is the only way back from a berth id to an ordinal.
+        // This used to be arithmetic here too - a third copy of the allocator's
+        // own scheduleId * 1000 + ordinal - so the reference, the adapter and the
+        // test all shared one convention and none of them matched pool_berths.
+        List<Long> poolBerthIds = berthIds(pool, scenario.berths());
+        redisAllocator.provision(
+                pool, scenario.berths(), scenario.segments(), poolBerthIds, List.of());
 
         var holdIds = new ArrayList<String>();
         int nextHold = 0;
@@ -256,7 +262,7 @@ class AllocatorEquivalenceProperties {
                         // here on even though both answers looked correct.
                         var luaOrdinals =
                                 luaAlloc.berthIds().stream()
-                                        .map(id -> (int) (id - pool.scheduleId() * 1000L))
+                                        .map(poolBerthIds::indexOf)
                                         .toList();
                         assertEquals(
                                 javaAlloc.berthOrdinals(),
@@ -346,7 +352,7 @@ class AllocatorEquivalenceProperties {
         // must be caught by the very next state comparison.
         var pool = new PoolKey(NEXT_SCHEDULE.getAndIncrement(), TravelClass.SL, QuotaType.TATKAL);
         var java = new BerthPool(2, 4);
-        redisAllocator.provision(pool, 2, 4, List.of());
+        redisAllocator.provision(pool, 2, 4, berthIds(pool, 2), List.of());
 
         var scenario = new Scenario(2, 4, List.of());
         assertSameState(java, pool, scenario, 0, new Op.Release(0));
@@ -366,4 +372,21 @@ class AllocatorEquivalenceProperties {
                 error.getMessage().contains("mask differs"),
                 () -> "the report must name what diverged, got: " + error.getMessage());
     }
+
+    /**
+     * Berth ids that carry no arithmetic relationship to their ordinal.
+     *
+     * <p>T-7 asserts the two implementations choose the <em>same berth</em>, not
+     * merely an equally valid one. Ids derived from the ordinal would let both
+     * sides agree by construction; descending, non-contiguous ids mean the
+     * agreement has to be real.
+     */
+    private static List<Long> berthIds(PoolKey pool, int berthCount) {
+        var ids = new ArrayList<Long>(berthCount);
+        for (int ordinal = 0; ordinal < berthCount; ordinal++) {
+            ids.add(pool.scheduleId() * 1_000_000L + (64 - ordinal) * 3L + 1L);
+        }
+        return List.copyOf(ids);
+    }
+
 }

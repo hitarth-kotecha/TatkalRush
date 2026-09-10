@@ -2,7 +2,9 @@ package io.tatkalrush.ops.warmup;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.lettuce.core.RedisClient;
@@ -175,6 +177,56 @@ class PoolRebuilderTest {
         }
 
         @Test
+        @DisplayName("allocation returns real berths.id values, not derived ones")
+        void theBerthIdsAreTheOnesPostgresHas() throws SQLException {
+            rebuilder.rebuildAll();
+
+            var allocated =
+                    (io.tatkalrush.application.ports.AllocationResult.Allocated)
+                            new RedisSeatAllocator(redis)
+                                    .allocate(
+                                            new io.tatkalrush.application.ports.AllocationRequest(
+                                                    SL_GENERAL,
+                                                    new SegmentRange(0, SEGMENTS),
+                                                    2,
+                                                    "warm-1",
+                                                    java.time.Instant.parse("2026-09-20T00:00:00Z"),
+                                                    120_000L));
+
+            // The berths this pool's ordinals 0 and 1 actually map to. Before the
+            // mapping was stored, the allocator answered scheduleId * 1000 + ordinal
+            // - which the foreign key accepted whenever it happened to land inside
+            // berths.id, recording the wrong berth without an error anywhere.
+            assertEquals(expectedBerthIds(SL_GENERAL, 2), allocated.berthIds());
+        }
+
+        @Test
+        void everyProvisionedIdExistsInPoolBerths() throws SQLException {
+            rebuilder.rebuildAll();
+
+            assertEquals(
+                    expectedBerthIds(SL_GENERAL, SL_BERTHS),
+                    storedMapping(SL_GENERAL),
+                    "the mapping must be pool_berths in pool_ordinal order");
+        }
+
+        @Test
+        @DisplayName("the mapping follows pool_ordinal, not berth id order")
+        void theMappingIsInPoolOrdinalOrder() throws SQLException {
+            rebuilder.rebuildAll();
+
+            // TATKAL maps the same six berths in reverse. A query that read
+            // pool_berths in berth_id order would produce GENERAL's mapping for
+            // both pools - every berth at the wrong ordinal, silently.
+            List<Long> tatkal = storedMapping(SL_TATKAL);
+            List<Long> general = storedMapping(SL_GENERAL);
+
+            assertEquals(expectedBerthIds(SL_TATKAL, SL_BERTHS), tatkal);
+            assertNotEquals(general, tatkal, "the two pools must not share an ordering");
+            assertEquals(general.reversed(), tatkal, "TATKAL is GENERAL reversed");
+        }
+
+        @Test
         void aDepartedSchedulesPoolsAreLeftAlone() throws SQLException {
             rebuilder.rebuildAll();
 
@@ -255,9 +307,11 @@ class PoolRebuilderTest {
             // the booking's quota, and dropping that would put every TATKAL sale
             // into GENERAL's masks as well.
             assertEquals(0L, snapshotOf(SL_GENERAL).masks()[2], "GENERAL is untouched");
-            // Berth id 3 is coach ordinal 2, and pool_ordinal mirrors it - the same
-            // slot in both pools, because both map the same physical berths.
-            assertEquals(0b1111L, snapshotOf(SL_TATKAL).masks()[2], "TATKAL, same berth");
+            // Berth id 3 is coach ordinal 2. GENERAL maps that to pool_ordinal 2;
+            // TATKAL maps it reversed, to 5 - 2 = 3. Same physical berth, different
+            // slot - which is the whole point of storing the mapping rather than
+            // computing it.
+            assertEquals(0b1111L, snapshotOf(SL_TATKAL).masks()[3], "TATKAL, same berth");
         }
 
         @Test
@@ -369,6 +423,41 @@ class PoolRebuilderTest {
         }
 
         @Test
+        @DisplayName("a pool with a gap in its ordinals is refused, not half-provisioned")
+        void aNonContiguousPoolIsRefused() throws SQLException {
+            // Ordinals 0,1,2,3,4,9 for six berths: the row count is right, so a
+            // size check passes, and index 5 maps to nothing while the berth at
+            // ordinal 9 is outside the mask array entirely.
+            try (Statement st = conn.createStatement()) {
+                st.execute(
+                        "UPDATE pool_berths SET pool_ordinal = 9"
+                            + " WHERE pool_ordinal = 5 AND pool_id ="
+                            + " (SELECT id FROM quota_pools WHERE schedule_id = 2"
+                            + "  AND travel_class = 'SL' AND quota_type = 'GENERAL')");
+            }
+            try {
+                var result = rebuilder.rebuildAll();
+
+                assertEquals(6, result.pools(), "one of the seven is refused");
+                assertNull(
+                        redis.get("masks:2:SL:GENERAL"),
+                        "a pool that cannot be named must not be allocatable");
+                assertTrue(
+                        result.shapeWarnings().stream()
+                                .anyMatch(w -> w.contains("NOT provisioned")),
+                        result.shapeWarnings().toString());
+            } finally {
+                try (Statement st = conn.createStatement()) {
+                    st.execute(
+                            "UPDATE pool_berths SET pool_ordinal = 5"
+                                + " WHERE pool_ordinal = 9 AND pool_id ="
+                                + " (SELECT id FROM quota_pools WHERE schedule_id = 2"
+                                + "  AND travel_class = 'SL' AND quota_type = 'GENERAL')");
+                }
+            }
+        }
+
+        @Test
         void aShapeWarningDoesNotStopTheOtherPools() throws SQLException {
             try (Statement st = conn.createStatement()) {
                 st.execute(
@@ -385,6 +474,36 @@ class PoolRebuilderTest {
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
+
+    /** The mapping the allocator will actually use, read back from Redis. */
+    private static List<Long> storedMapping(PoolKey pool) {
+        String stored = redis.get("berthids:" + pool.keySuffix());
+        assertNotNull(stored, "no mapping written for " + pool);
+        return java.util.Arrays.stream(stored.split(",")).map(Long::valueOf).toList();
+    }
+
+    /** {@code pool_berths.berth_id} for ordinals {@code 0..count-1}, from Postgres. */
+    private static List<Long> expectedBerthIds(PoolKey pool, int count) throws SQLException {
+        var ids = new java.util.ArrayList<Long>(count);
+        try (Statement st = conn.createStatement();
+                var rs =
+                        st.executeQuery(
+                                ("SELECT pb.berth_id FROM pool_berths pb"
+                                    + " JOIN quota_pools q ON q.id = pb.pool_id"
+                                    + " WHERE q.schedule_id = %d AND q.travel_class = '%s'"
+                                    + "   AND q.quota_type = '%s' AND pb.pool_ordinal < %d"
+                                    + " ORDER BY pb.pool_ordinal")
+                                        .formatted(
+                                                pool.scheduleId(),
+                                                pool.travelClass().code(),
+                                                pool.quotaType().name(),
+                                                count))) {
+            while (rs.next()) {
+                ids.add(rs.getLong(1));
+            }
+        }
+        return List.copyOf(ids);
+    }
 
     private static PoolSnapshot snapshotOf(PoolKey pool) {
         String masks = redis.get("masks:" + pool.keySuffix());
@@ -482,12 +601,24 @@ class PoolRebuilderTest {
                         + " (3,'SL','GENERAL',6),(3,'SL','TATKAL',6),"
                         + " (4,'SL','GENERAL',6),(4,'SL','TATKAL',6)");
 
-            // Every SL pool maps the same six physical berths; 3A maps its four.
+            // Every SL pool maps the same six physical berths.
+            //
+            // GENERAL maps them in id order; TATKAL maps them REVERSED, so that
+            // pool_ordinal order and berth_id order disagree for at least one pool.
+            // Without that, a rebuild that read pool_berths in id order instead of
+            // pool_ordinal order would produce an identical mapping and no test
+            // could tell - which is exactly the ordering bug that puts every berth
+            // at the wrong ordinal.
             st.execute(
                     "INSERT INTO pool_berths (pool_id, berth_id, pool_ordinal)"
                         + " SELECT q.id, b.id, b.ordinal"
                         + " FROM quota_pools q JOIN berths b ON b.coach_id = 1"
-                        + " WHERE q.travel_class = 'SL'");
+                        + " WHERE q.travel_class = 'SL' AND q.quota_type = 'GENERAL'");
+            st.execute(
+                    "INSERT INTO pool_berths (pool_id, berth_id, pool_ordinal)"
+                        + " SELECT q.id, b.id, 5 - b.ordinal"
+                        + " FROM quota_pools q JOIN berths b ON b.coach_id = 1"
+                        + " WHERE q.travel_class = 'SL' AND q.quota_type = 'TATKAL'");
             st.execute(
                     "INSERT INTO pool_berths (pool_id, berth_id, pool_ordinal)"
                         + " SELECT q.id, b.id, b.ordinal"

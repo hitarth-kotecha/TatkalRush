@@ -2558,6 +2558,96 @@ the calendar and this knob is no longer carrying anything.
 
 ---
 
+### DD-042 — Berth ids are stored, not derived
+
+Date: 2026-09-10 · Author: Phase 1c · Phase: 1 · Requirements: FR-5, FR-16, FR-25, INV-8, §13.4
+Supersedes: —
+
+**Context.**
+
+`RedisSeatAllocator` turned a pool ordinal into a `berths.id` with arithmetic:
+`scheduleId * 1000 + ordinal`. A comment said this matched the seed generator's
+scheme and that Phase 1b would cache the real mapping. Neither was true. Real ids
+come from `pool_berths`, and the arithmetic bears no relation to them.
+
+Running the system against seeded data showed the cost:
+
+- Where the fabricated id happened to land inside `berths.id`, the foreign key
+  accepted it and the booking recorded **the wrong berth**. Measured: pool 5's
+  ordinal 7 is berth 8; the arithmetic stored 5007, an id not in that pool at all.
+- Above `max(berths.id)` — 9,704 on the seeded dataset — the insert failed and the
+  hold returned 500. Schedule 21 produced 21000.
+
+**No test saw it.** `InMemorySeatAllocator` used the same formula, the contract
+suite's fixture reproduced it, and T-7's comparison inverted it. Four components
+agreed with each other and none agreed with the database. That is the one failure a
+convention shared between a fake and its adapter is guaranteed to hide, and it is
+the third time this project has been bitten by a fake that outran its port.
+
+**Decision.**
+
+The mapping is stored in Redis as `berthids:{pool}` — a comma-joined decimal
+string, written by `provision` and read once per pool per JVM. `provision` now
+**requires** the list; there is no defaulting overload, because an allocator that
+can invent ids will.
+
+Two details carry weight:
+
+- **Written before the masks.** If the mapping succeeds and `init-pool` then fails,
+  the pool reads as unprovisioned — a clear error. The other order leaves masks the
+  allocator can allocate from and no way to name the berths it allocated, which is
+  the state that writes wrong ids.
+- **Each id is placed at its own ordinal** during the rebuild, not appended in
+  query order. Ordinals `0,1,5` for three rows pass any size check and, appended,
+  put a berth nobody asked for at ordinal 2. Placing by index cannot be wrong about
+  order, and a gap becomes an unfilled slot that refuses the pool outright.
+
+**Alternatives considered.**
+
+1. **Rejected — read `pool_berths` per allocation.** Always correct, no cache to
+   invalidate. It puts a Postgres round trip on the hot path Strategy A exists to
+   keep clear, and §9.4 would then be comparing an allocator that talks to Postgres
+   against one that does not.
+
+2. **Rejected — hold the mapping in the allocator's JVM cache only, loaded from
+   Postgres at startup.** No new Redis key and no schema knowledge in the warm-up.
+   `adapters/allocator-redis` would need a JDBC dependency it has no other use for,
+   and a replica that started before a pool existed would never learn it.
+
+3. **Rejected — make the seed generator assign `pool_berths.berth_id` to match the
+   arithmetic.** The cheapest possible fix: change the data to fit the code. It
+   makes `berths.id` meaningless as an identity, breaks the moment any berth is
+   added, and encodes a Redis implementation detail into the durable schema.
+
+**Consequences.**
+
+Memory: roughly 2 KB per pool, ~7 MB across the seeded 3,600 — inside Redis's
+384 MB limit with room to spare.
+
+`ordinalOf` is now a linear search rather than a subtraction. At most a few hundred
+berths, on the release and confirm paths rather than the allocation path, against
+an array already in memory. A reverse index would be a second structure to keep
+consistent with the first for no measurable gain.
+
+**The test fixtures now use descending, non-contiguous ids** in all three places
+that previously shared the formula. Ordinal order is not id order, so FR-5's
+"lowest first" means lowest *ordinal* and a test can tell the difference. The
+rebuild's query is ordered by `berth_id` on purpose — an order that is not the
+answer, so that placing-by-ordinal has to actually work rather than coincide.
+
+Verified end to end: a TATKAL hold that previously returned 500 now stores berth
+ids 468 and 469, which are `pool_berths` ordinals 0 and 1 for that pool.
+
+**What would change this.**
+
+If Strategy B's partition owner ends up holding pool membership in its own state —
+which §9.3's checkpoint format may require anyway — the mapping has a second home
+and Redis stops being the only place it lives. The falsifiable form: **if INV-8
+ever reports a mismatch whose berth id is absent from `pool_berths`**, the mapping
+and the durable record have diverged and storing it in one place has failed.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |

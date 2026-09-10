@@ -55,7 +55,8 @@ import java.util.Map;
 public final class PoolRebuilder {
 
     /**
-     * @param pools pools provisioned
+     * @param pools pools provisioned. Fewer than exist when a pool was refused
+     *     for a shape problem serious enough to make its ids unusable.
      * @param berths berth slots initialised across them
      * @param allocationsReplayed confirmed {@code seat_allocations} rows folded into
      *     masks. Zero on a freshly seeded system, non-zero after C2.
@@ -87,8 +88,10 @@ public final class PoolRebuilder {
         List<PoolShape> shapes = poolShapes();
         var replayed = new int[1];
         Map<Long, long[]> masksByPool = occupiedMasks(shapes, replayed);
+        Map<Long, List<Long>> berthIdsByPool = berthIds(shapes);
 
         int berths = 0;
+        int provisioned = 0;
         var warnings = new ArrayList<String>();
 
         for (PoolShape shape : shapes) {
@@ -113,13 +116,28 @@ public final class PoolRebuilder {
                 }
             }
 
+            List<Long> ids = berthIdsByPool.get(shape.poolId());
+            if (ids == null) {
+                // The pool's ordinals do not cover 0..berthCount-1, so some mask
+                // slot maps to no berth. Refused rather than provisioned with a
+                // partial mapping: a pool the allocator can allocate from and
+                // cannot fully name writes the wrong berth id, which is exactly
+                // the failure this whole mapping exists to remove. An unprovisioned
+                // pool is loud on the first request; a wrong mapping is silent.
+                warnings.add(
+                        ("pool=%s: pool_berths ordinals do not cover 0..%d - NOT provisioned")
+                                .formatted(shape.key(), shape.berthCount() - 1));
+                continue;
+            }
+
             allocator.provision(
-                    shape.key(), shape.berthCount(), shape.segmentCount(), occupied);
+                    shape.key(), shape.berthCount(), shape.segmentCount(), ids, occupied);
             berths += shape.berthCount();
+            provisioned++;
         }
 
         return new Result(
-                shapes.size(),
+                provisioned,
                 berths,
                 replayed[0],
                 List.copyOf(warnings),
@@ -243,6 +261,100 @@ public final class PoolRebuilder {
             }
         }
         return masks;
+    }
+
+    /**
+     * Each pool's {@code pool_ordinal -> berths.id} mapping.
+     *
+     * <p>This is the fact the allocator cannot derive and used to invent. Real ids
+     * live in {@code pool_berths}; the previous {@code scheduleId * 1000 + ordinal}
+     * produced ids that were accepted by the foreign key often enough to record the
+     * wrong berth silently, and rejected the rest of the time as a 500.
+     *
+     * <p><b>Each id is placed at its own ordinal</b> rather than appended in query
+     * order. Appending would make the mapping depend on an {@code ORDER BY} —
+     * correct, but silently wrong the moment the ordinals are not contiguous, since
+     * ordinals {@code 0,1,5} would produce three ids at indices {@code 0,1,2} and
+     * put a berth nobody asked for at ordinal 2. Placing by index cannot be wrong
+     * about order, and a gap becomes visible as an unfilled slot.
+     *
+     * <p>One query for every pool rather than one per pool: 3,600 pools on the
+     * seeded dataset, and the round trips would dominate a warm-up that otherwise
+     * takes eight seconds.
+     *
+     * @return ids by ordinal, or an entry absent entirely when the pool's ordinals
+     *     do not cover {@code 0..berthCount-1}
+     */
+    private Map<Long, List<Long>> berthIds(List<PoolShape> shapes) throws SQLException {
+        var sizes = new LinkedHashMap<Long, Integer>();
+        for (PoolShape shape : shapes) {
+            sizes.put(shape.poolId(), shape.berthCount());
+        }
+
+        String sql =
+                """
+                SELECT pb.pool_id, pb.pool_ordinal, pb.berth_id
+                FROM pool_berths pb
+                JOIN quota_pools q ON q.id = pb.pool_id
+                JOIN schedules s   ON s.id = q.schedule_id
+                WHERE s.status IN ('OPEN', 'CHARTED')
+                ORDER BY pb.pool_id, pb.berth_id
+                """;
+
+        // Ordered by BERTH ID, deliberately not by pool_ordinal. Placing each id at
+        // its own ordinal makes this loop independent of arrival order, and the
+        // only way to demonstrate that independence is to feed it an order that is
+        // not the answer. A mapping whose ordinals run opposite to its ids - which
+        // pool_berths permits - comes out right anyway.
+        //
+        // 0 is a legal berth id in principle, so an unfilled slot needs a value no
+        // real id can take. -1 works because berths.id is a BIGSERIAL.
+        var byPool = new LinkedHashMap<Long, long[]>();
+        try (PreparedStatement ps = connection.prepareStatement(sql);
+                ResultSet rs = ps.executeQuery()) {
+            while (rs.next()) {
+                long poolId = rs.getLong("pool_id");
+                Integer size = sizes.get(poolId);
+                if (size == null) {
+                    continue;
+                }
+                int ordinal = rs.getInt("pool_ordinal");
+                if (ordinal < 0 || ordinal >= size) {
+                    // Out of range for this pool's mask array. Left out, which
+                    // shows up below as an unfilled slot and refuses the pool.
+                    continue;
+                }
+                long[] ids =
+                        byPool.computeIfAbsent(
+                                poolId,
+                                id -> {
+                                    var fresh = new long[size];
+                                    java.util.Arrays.fill(fresh, -1L);
+                                    return fresh;
+                                });
+                ids[ordinal] = rs.getLong("berth_id");
+            }
+        }
+
+        var complete = new LinkedHashMap<Long, List<Long>>();
+        for (var entry : byPool.entrySet()) {
+            long[] ids = entry.getValue();
+            boolean full = true;
+            for (long id : ids) {
+                if (id < 0) {
+                    full = false;
+                    break;
+                }
+            }
+            if (full) {
+                var boxed = new ArrayList<Long>(ids.length);
+                for (long id : ids) {
+                    boxed.add(id);
+                }
+                complete.put(entry.getKey(), List.copyOf(boxed));
+            }
+        }
+        return complete;
     }
 
     /**

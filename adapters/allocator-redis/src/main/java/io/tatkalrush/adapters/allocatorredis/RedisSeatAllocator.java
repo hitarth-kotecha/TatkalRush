@@ -72,12 +72,43 @@ public final class RedisSeatAllocator implements SeatAllocator {
     /**
      * Creates or rebuilds a pool's Redis state (§9.2, §13.4).
      *
+     * @param poolBerthIds {@code berths.id} for each pool ordinal, in ordinal
+     *     order. <b>Required</b>, and deliberately not defaulted: an allocator that
+     *     can invent berth ids will, and the invented ones are accepted by the
+     *     foreign key often enough to corrupt bookings silently rather than fail.
+     *     See {@link #berthIds}.
      * @param occupied confirmed allocations to replay in, as
      *     {@code "ordinal:maskLo:maskHi"}. Used by §13.4's rebuild after chaos C2
      *     flushes Redis; empty at schedule creation.
      */
     public void provision(
-            PoolKey pool, int berthCount, int segmentCount, List<String> occupied) {
+            PoolKey pool,
+            int berthCount,
+            int segmentCount,
+            List<Long> poolBerthIds,
+            List<String> occupied) {
+
+        if (poolBerthIds.size() != berthCount) {
+            throw new IllegalArgumentException(
+                    "pool %s: %d berth ids for %d berths"
+                            .formatted(pool, poolBerthIds.size(), berthCount));
+        }
+
+        var joined = new StringBuilder(berthCount * 5);
+        for (int i = 0; i < poolBerthIds.size(); i++) {
+            if (i > 0) {
+                joined.append(',');
+            }
+            joined.append(poolBerthIds.get(i).longValue());
+        }
+
+        // Written BEFORE the masks. If this succeeds and init-pool then fails, the
+        // pool has no masks and reads as unprovisioned - a clear error. The other
+        // order leaves masks the allocator can allocate from and no way to name the
+        // berths it allocated, which is the state that writes wrong ids.
+        redis.set(berthIdsKey(pool), joined.toString());
+        berthIds.put(pool, poolBerthIds.stream().mapToLong(Long::longValue).toArray());
+
         var args = new ArrayList<String>(2 + occupied.size());
         args.add(String.valueOf(berthCount));
         args.add(String.valueOf(segmentCount));
@@ -324,6 +355,19 @@ public final class RedisSeatAllocator implements SeatAllocator {
         return "holdpool:" + holdId;
     }
 
+    /**
+     * {@code berthids:{pool}} — the pool ordinal to {@code berths.id} mapping.
+     *
+     * <p>A comma-joined decimal string rather than the packed little-endian blobs
+     * next to it. Those are packed because Lua manipulates them; nothing in any
+     * script touches a berth id, so the only consumers are Java and whoever is
+     * looking at {@code redis-cli} trying to work out which berth ordinal 41 is.
+     * Legibility wins where there is no atomicity to buy.
+     */
+    private static String berthIdsKey(PoolKey pool) {
+        return "berthids:" + pool.keySuffix();
+    }
+
     // -------------------------------------------------------------- lookups
 
     private PoolShape shapeOf(PoolKey pool) {
@@ -353,28 +397,92 @@ public final class RedisSeatAllocator implements SeatAllocator {
     }
 
     /**
-     * Maps a pool ordinal to a database berth id.
+     * The pool's {@code pool_ordinal -> berths.id} mapping, cached per JVM.
      *
-     * <p>Derived rather than stored, matching the seed generator's own scheme. A
-     * real deployment would read {@code pool_berths.berth_id} for the ordinal;
-     * doing that per allocation would add a Postgres round trip to the hot path
-     * that Strategy A exists to keep off it, so Phase 1b caches the mapping
-     * alongside the pool shape.
+     * <h2>What this replaced, and why it mattered</h2>
+     *
+     * <p>This used to be arithmetic: {@code scheduleId * 1000 + ordinal}, with a
+     * comment claiming it matched the seed generator's scheme and that Phase 1b
+     * would cache the real mapping. Neither was true. Real ids come from
+     * {@code pool_berths}, and running the system against seeded data showed what
+     * the arithmetic actually does:
+     *
+     * <ul>
+     *   <li>Where the fabricated id happens to land inside {@code berths.id}, the
+     *       foreign key accepts it and the booking records <b>the wrong berth</b>.
+     *       Measured: pool 5's ordinal 7 is berth 8, and the arithmetic stored
+     *       5007 — an id not in that pool at all.
+     *   <li>Above {@code max(berths.id)}, the insert fails and the hold 500s.
+     * </ul>
+     *
+     * <p>No test saw it because {@code InMemorySeatAllocator} uses the same
+     * formula. The fake and the adapter agreed with each other and both disagreed
+     * with the database, which is the one failure mode a shared convention between
+     * a fake and its adapter is guaranteed to hide.
+     *
+     * <h2>Stored in Redis, not read from Postgres</h2>
+     *
+     * <p>Reading {@code pool_berths} per allocation would put a Postgres round trip
+     * on the hot path Strategy A exists to keep clear. The mapping is fixed at
+     * provisioning time and written alongside the masks, so the allocator reads it
+     * once per pool per JVM and never again — and §13.4's rebuild, which already
+     * queries {@code pool_berths}, is the component that has it to give.
      */
-    private long berthIdOf(PoolKey pool, int ordinal) {
-        return pool.scheduleId() * 1000L + ordinal;
+    private final ConcurrentHashMap<PoolKey, long[]> berthIds = new ConcurrentHashMap<>();
+
+    private long[] berthIdsOf(PoolKey pool) {
+        return berthIds.computeIfAbsent(
+                pool,
+                key -> {
+                    String packed = redis.get(berthIdsKey(key));
+                    if (packed == null || packed.isEmpty()) {
+                        // Distinct from "pool not provisioned": the masks may be
+                        // present. This says the pool was provisioned by something
+                        // that did not supply the mapping, which is a caller bug
+                        // and not a missing warm-up.
+                        throw new IllegalStateException(
+                                "no berth id mapping for " + key
+                                        + " - provision() was called without one");
+                    }
+                    String[] parts = packed.split(",");
+                    var ids = new long[parts.length];
+                    for (int i = 0; i < parts.length; i++) {
+                        ids[i] = Long.parseLong(parts[i]);
+                    }
+                    return ids;
+                });
     }
 
-    /** The inverse of {@link #berthIdOf}, and it must stay the exact inverse. */
-    private int ordinalOf(PoolKey pool, long berthId) {
-        long ordinal = berthId - pool.scheduleId() * 1000L;
-        if (ordinal < 0 || ordinal > Integer.MAX_VALUE) {
-            // A berth id from another pool. Refusing beats clearing whatever bit
-            // the arithmetic happens to land on, which would free a berth
-            // belonging to a booking nobody cancelled.
+    /** Maps a pool ordinal to the {@code berths.id} row it stands for. */
+    private long berthIdOf(PoolKey pool, int ordinal) {
+        long[] ids = berthIdsOf(pool);
+        if (ordinal < 0 || ordinal >= ids.length) {
             throw new IllegalArgumentException(
-                    "berth %d does not belong to pool %s".formatted(berthId, pool));
+                    "ordinal %d is outside pool %s (%d berths)"
+                            .formatted(ordinal, pool, ids.length));
         }
-        return (int) ordinal;
+        return ids[ordinal];
+    }
+
+    /**
+     * The inverse, by search rather than by arithmetic.
+     *
+     * <p>Linear over the pool's berths — at most a few hundred, on the release and
+     * confirm paths rather than the allocation path, and against an array already
+     * in memory. A reverse index would be a second structure to keep consistent
+     * with the first for no measurable gain.
+     */
+    private int ordinalOf(PoolKey pool, long berthId) {
+        long[] ids = berthIdsOf(pool);
+        for (int ordinal = 0; ordinal < ids.length; ordinal++) {
+            if (ids[ordinal] == berthId) {
+                return ordinal;
+            }
+        }
+        // A berth id from another pool. Refusing beats clearing whatever bit an
+        // arithmetic guess happens to land on, which would free a berth belonging
+        // to a booking nobody cancelled.
+        throw new IllegalArgumentException(
+                "berth %d does not belong to pool %s".formatted(berthId, pool));
     }
 }
