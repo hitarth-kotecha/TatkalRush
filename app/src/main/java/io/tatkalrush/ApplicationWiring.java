@@ -81,8 +81,32 @@ public class ApplicationWiring {
      * directly cannot be tested at a boundary without waiting for one.
      */
     @Bean
-    InstantSource clock() {
-        return InstantSource.system();
+    InstantSource clock(@Value("${tatkalrush.clock.offset:PT0S}") String offset) {
+        Duration shift = Duration.parse(offset);
+        if (shift.isZero()) {
+            return InstantSource.system();
+        }
+
+        // OFFSET, never fixed. A frozen clock stops holds from expiring, so FR-18's
+        // reaper has nothing to do and FR-24's payment-side expiry check can never
+        // fire - which removes two of the behaviours a load run exists to exercise.
+        // An offset keeps time flowing and merely moves where the system stands
+        // relative to the dataset.
+        //
+        // The alternative was moving the DATA: shifting the seed's BASE_DATE to
+        // "today". That date is fixed precisely because LocalDate.now() makes two
+        // runs incomparable (FR-50), and changing it invalidates every benchmark in
+        // docs/benchmarks/ for comparison purposes.
+        log.warn(
+                "CLOCK IS OFFSET BY {} (FR-31, tatkalrush.clock.offset). Every time-dependent"
+                    + " decision - the Tatkal window, hold expiry, refund tiers - is being made"
+                    + " {} from wall-clock. This exists so §19's profiles can run against an"
+                    + " open Tatkal window (AC-1.11) on a fixed dataset. It must be PT0S in"
+                    + " anything resembling production.",
+                shift,
+                shift.isNegative() ? shift.abs() + " in the past" : shift + " in the future");
+
+        return InstantSource.offset(InstantSource.system(), shift);
     }
 
     @Bean(destroyMethod = "shutdown")

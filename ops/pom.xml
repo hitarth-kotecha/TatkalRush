@@ -17,6 +17,7 @@
 
   <modules>
     <module>invariant-checker</module>
+    <module>pool-warmup</module>
     <module>seed</module>
   </modules>
 

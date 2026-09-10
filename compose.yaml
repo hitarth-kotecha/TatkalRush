@@ -25,6 +25,17 @@ x-app-env: &app-env
   SPRING_DATASOURCE_PASSWORD: tatkal
   SPRING_DATA_REDIS_HOST: redis
   SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  # FR-31's clock, as an ISO-8601 Duration. PT0S - the system clock - unless the
+  # environment says otherwise.
+  #
+  # §19's profiles need it. The seed's BASE_DATE is fixed at 2026-10-01 so two
+  # runs stay comparable (FR-50), which means every TATKAL window in the dataset
+  # is shut for anyone running before late September 2026 - and AC-1.11 requires
+  # P1 to run against an OPEN one. The lever moves the system, not the data:
+  # shifting BASE_DATE would invalidate every committed benchmark instead.
+  #
+  #   TATKAL_CLOCK_OFFSET=P40D docker compose up -d
+  TATKALRUSH_CLOCK_OFFSET: ${TATKAL_CLOCK_OFFSET:-PT0S}
 
 x-app-base: &app-base
   build:

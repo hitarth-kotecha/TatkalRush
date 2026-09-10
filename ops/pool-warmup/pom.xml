@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.tatkalrush</groupId>
+    <artifactId>tatkal-rush</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>pool-warmup</artifactId>
+  <name>ops/pool-warmup (SDD 13.4 rebuild: Postgres -&gt; Redis pool state)</name>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>domain</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <!--
+      The allocator, because provisioning IS an allocator operation - init-pool.lua
+      owns the mask and free-count layout, and a second writer that reproduced that
+      layout would be a second definition of it.
+
+      Note the contrast with ops/invariant-checker, which deliberately does NOT
+      depend on this module: the checker has to be able to disagree with the
+      allocator. A writer has the opposite obligation - it must agree exactly.
+    -->
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>allocator-redis</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>persistence</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!--
+      Test scope only, and it is the point of the module's best test: rebuild the
+      pools, then run the REAL §14 checks against the result. INV-8 derives its
+      expected masks from seat_allocations independently of this code, so the two
+      agreeing is evidence rather than a restatement.
+
+      C2's acceptance in §19.2 is worded exactly this way - "masks AND free counts
+      rebuilt; INV-8 and INV-12 pass after rebuild" - so the test is the criterion.
+    -->
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>invariant-checker</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-core</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

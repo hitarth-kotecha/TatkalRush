@@ -33,12 +33,13 @@ COPY adapters/web/pom.xml              adapters/web/
 COPY admission/pom.xml                 admission/
 COPY ops/pom.xml                       ops/
 COPY ops/invariant-checker/pom.xml     ops/invariant-checker/
+COPY ops/pool-warmup/pom.xml           ops/pool-warmup/
 COPY ops/seed/pom.xml                  ops/seed/
 COPY app/pom.xml                       app/
 COPY archtest/pom.xml                  archtest/
 COPY differential/pom.xml              differential/
 
-RUN mvn -B -q dependency:go-offline -DexcludeArtifactIds=domain,application,persistence,allocator-redis,allocator-swp,messaging,payment-sim,web,admission,invariant-checker
+RUN mvn -B -q dependency:go-offline -DexcludeArtifactIds=domain,application,persistence,allocator-redis,allocator-swp,messaging,payment-sim,web,admission,invariant-checker,pool-warmup
 
 # ---------------------------------------------------------------------------
 # Stage 2 - build.

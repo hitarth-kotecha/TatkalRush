@@ -2417,6 +2417,147 @@ is wrong and search needs its own bucket.
 
 ---
 
+### DD-040 — §13.4's rebuild is an explicit operation, not lazy initialisation
+
+Date: 2026-09-10 · Author: Phase 1c · Phase: 1 · Requirements: FR-13, §13.4, §19.2 C2, INV-8, INV-12
+Supersedes: —
+
+**Context.**
+
+`RedisSeatAllocator.provision` existed, was tested, and had **no production
+caller**. Seed 291,120 `pool_berths` rows, start the stack, and the first hold fails
+with `pool not provisioned` while every search reports `availableBerths: null` for
+every class. Postgres knows which berths exist; Redis is what the allocator reads.
+
+`init-pool.lua` was already written to serve two situations — schedule creation and
+recovery after chaos scenario C2's `FLUSHALL`. Nothing invoked either.
+
+**Decision.**
+
+`ops/pool-warmup`, a separate module with one job: read `quota_pools`,
+`pool_berths` and confirmed `seat_allocations`, and provision every pool on a live
+schedule. Run after seeding, and again after C2. Idempotent, because
+`init-pool.lua` writes whole pool state rather than mutating it.
+
+**It deliberately shares no SQL with INV-8.** INV-8 rebuilds expected masks from
+`seat_allocations` to *check* Redis; this rebuilds masks from `seat_allocations` to
+*write* Redis. If they shared code, INV-8 would be comparing Redis against a mask
+produced by the code that wrote it — a tautology wearing an invariant's name.
+`ops/invariant-checker`'s pom already states the principle for the allocator; this
+is the same rule applied to a writer.
+
+**Alternatives considered.**
+
+1. **Rejected — provision lazily, on first touch of a pool.** No new command and
+   self-healing after a flush. It puts a multi-kilobyte Lua write on the
+   *allocation* path, so P1's first seconds would measure provisioning rather than
+   allocation, and the cost lands at exactly the moment the spike arrives.
+
+2. **Rejected — fold it into `ops/seed`.** The same lifecycle moment, and genuinely
+   tempting. It couples the seeder to the allocator, and it puts Redis work inside
+   the window AC-0.2 times at ≤60 s — changing what a committed gate measures, in
+   order to avoid adding a module.
+
+3. **Rejected — put it in `ops/invariant-checker`,** which already holds both a
+   Postgres connection and a Lettuce client. That is precisely the module that must
+   be able to disagree with the writer, and giving the checker a write path removes
+   the independence INV-8's evidence rests on.
+
+**Consequences.**
+
+Measured on the reference machine: 3,600 pools and 291,120 berth slots in 8.4 s, a
+one-off cost outside any measurement window.
+
+The module's test runs the **real** §14 suite after a rebuild — SQL invariants and
+Redis invariants together — which is §19.2's wording for C2 turned into an
+assertion. Its first version called `InvariantChecker.standard()`, which is
+`SqlInvariants.all()`, so a test named for INV-8 and INV-12 ran neither. It now
+asserts that both actually executed, because a green report from a suite missing
+INV-8 looks identical to a green report from one that has it.
+
+Adding the module also broke the image build: the Dockerfile copies each module's
+POM by name, so a new module is a two-place change. Caught by `docker compose
+build`, not by `mvn verify` — the reactor and the image have separate ideas of what
+the module list is.
+
+**What would change this.**
+
+If schedule creation ever becomes an API rather than a row the seeder writes, that
+endpoint is the natural place to provision, and this becomes recovery-only. The
+falsifiable form: **if a pool ever appears in `quota_pools` without a matching
+`masks:` key during a run** — which INV-8 already reports as "in Redis but not in
+`quota_pools`" from the other direction — then an out-of-band warm-up is not
+sufficient and provisioning belongs on the creation path.
+
+---
+
+### DD-041 — The clock moves, the dataset does not
+
+Date: 2026-09-10 · Author: Phase 1c · Phase: 1 · Requirements: FR-28, FR-30, FR-31, FR-50, AC-1.11
+Supersedes: —
+
+**Context.**
+
+The seed's `BASE_DATE` is fixed at 2026-10-01, with 30 forward days. Anyone running
+before late September 2026 finds **every TATKAL window in the dataset shut** —
+sleeper opens 11:00 IST on D-1, so the earliest is 2026-09-30.
+
+AC-1.11 requires P1 to run against an **open** window. Without a lever, the profile
+the project is named after spends its entire spike collecting `QUOTA_LOCKED`, and
+measures the rejection path.
+
+**Decision.**
+
+`tatkalrush.clock.offset`, an ISO-8601 `Duration`, default `PT0S`, surfaced through
+Compose as `TATKAL_CLOCK_OFFSET`. Non-zero values log a `WARN` at startup naming
+every decision they affect.
+
+Possible at all only because FR-30 made the window a **pure function of a clock the
+system is handed** rather than a scheduled job. There is no state to migrate and no
+job to re-fire: one config value moves the whole system relative to the data.
+
+**Alternatives considered.**
+
+1. **Rejected — shift the seed's `BASE_DATE` to "today".** The obvious fix, and it
+   destroys the thing the fixed date exists to protect: `LocalDate.now()` makes two
+   runs incomparable (FR-50), and changing the constant invalidates every benchmark
+   in `docs/benchmarks/` for comparison purposes. The dataset is the control
+   variable in §9.4's comparison; moving it to fix a clock problem is the wrong
+   half of the pair.
+
+2. **Rejected — `InstantSource.fixed`, freezing time at a chosen instant.** Simpler
+   to reason about and simpler to assert on. It stops holds from expiring, so
+   FR-18's reaper has nothing to sweep and FR-24's "was the hold still valid?" check
+   can never fire — removing two of the behaviours a load run exists to exercise.
+   An offset keeps time flowing.
+
+3. **Rejected — a test-only profile that stubs the window open.** Keeps the knob out
+   of the production wiring entirely. It makes the benchmark exercise a different
+   code path from the one that ships, which is exactly what §9.4's comparison must
+   not do.
+
+**Consequences.**
+
+The offset is global. Hold expiry, refund tiers and chart timing all move with the
+window, which is correct — a partial offset would put the system in a state no real
+clock produces. It also means a benchmark report must record the offset it ran
+under, alongside NFR-12's other metadata.
+
+Verified end to end: at `P40D` the running stack reports `bookable: true` and
+`opensAt: null` for a journey on 2026-10-21, and `bookable: false` with
+`opensAt: 2026-10-24T05:30:00Z` for one on 2026-10-25 — the window opening exactly
+where FR-28 says it does.
+
+**What would change this.**
+
+If the seed ever generates journey dates relative to run time — which would require
+a different answer to FR-50 than the one DD-024 gave — the offset becomes dead
+weight. The falsifiable form: **if `TATKAL_CLOCK_OFFSET` is `PT0S` for a full P1 run
+that still reports zero `QUOTA_LOCKED` responses**, the dataset has caught up with
+the calendar and this knob is no longer carrying anything.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |
