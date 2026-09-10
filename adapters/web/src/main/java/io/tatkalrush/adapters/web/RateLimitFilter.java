@@ -10,6 +10,7 @@ import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.time.InstantSource;
 import java.util.List;
+import org.springframework.context.annotation.Profile;
 import org.springframework.core.Ordered;
 import org.springframework.core.annotation.Order;
 import org.springframework.http.MediaType;
@@ -34,6 +35,14 @@ import org.springframework.web.filter.OncePerRequestFilter;
  * generator reads it and refuses to publish a run where it is non-zero.
  */
 @Component
+// §8.3 runs one image in three roles, and this one belongs to app-1 and app-2.
+// The profile guard is not tidiness: RateLimiter is wired by ApplicationWiring,
+// which is itself @Profile("!psp-sim"), so an unguarded @Component here means the
+// simulator cannot construct this filter and the whole context fails to start.
+// It did - psp-sim crash-looped on "required a bean of type RateLimiter" from the
+// moment FR-60 landed, and nobody saw it because the running stack was serving a
+// stale image built before the rate limiter existed.
+@Profile("!psp-sim")
 // After authentication (HIGHEST + 10), because the key is the authenticated user.
 @Order(Ordered.HIGHEST_PRECEDENCE + 20)
 public class RateLimitFilter extends OncePerRequestFilter {
