@@ -96,4 +96,53 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <!--
+    An executable jar, because this is run by hand and by scripts on a Windows
+    box where a hand-assembled classpath is a source of bugs rather than a
+    convenience. The first attempt at running it built the classpath in the shell
+    and failed with "No suitable driver found" - the driver jar was on the
+    classpath, and the separator was not what the shell thought it was.
+
+    Shaded rather than spring-boot:repackage: there is no Spring context here, and
+    a plain main class in an ordinary jar is one fewer moving part.
+  -->
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <finalName>pool-warmup</finalName>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>io.tatkalrush.ops.warmup.PoolWarmupMain</mainClass>
+                </transformer>
+                <!-- Lettuce and netty ship META-INF/services entries that must be
+                     concatenated, not overwritten, or the Redis client cannot
+                     resolve its own codecs. -->
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+              </transformers>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>

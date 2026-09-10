@@ -358,8 +358,8 @@ Numbers are calibrated to a single laptop running the full stack **plus** the lo
 
 | ID | Requirement | Target |
 |---|---|---|
-| NFR-1 | Sustained mixed-workload throughput (90% read / 10% write) | **Set by AC-0.7.** v1.2's ≥ 2,000 req/s retained only as the 16 GB reference figure |
-| NFR-2 | Peak spike throughput, 30 s window, single hot partition | **Set by AC-0.7**, accepted-or-queued. v1.2's ≥ 5,000 req/s retained only as the 16 GB reference figure |
+| NFR-1 | Sustained mixed-workload throughput (90% read / 10% write) | **550 req/s**, measured by AC-1.13 on 2026-09-10 (`docs/benchmarks/001-nfr-calibration.md`). v1.2's ≥ 2,000 req/s was the 16 GB reference figure |
+| NFR-2 | Peak spike throughput, 30 s window, single hot partition | **≥ 150 req/s**, accepted-or-queued — a FLOOR, not a ceiling. AC-1.13 reached the load generator's limit before the endpoint's: p99 was 27 ms against a 150 ms budget. v1.2's ≥ 5,000 req/s was the 16 GB reference figure |
 | NFR-3 | Hold endpoint latency, p99, at NFR-1 load | ≤ 150 ms |
 | NFR-4 | Hold endpoint latency, p99, at NFR-2 spike | ≤ 800 ms |
 | NFR-5 | Search endpoint latency, p99, at NFR-1 load | ≤ 50 ms |
@@ -375,7 +375,16 @@ Numbers are calibrated to a single laptop running the full stack **plus** the lo
 
 **On NFR-1, NFR-2 and NFR-11 (DD-019).** The machine has 7.91 GB of physical RAM and 8 logical CPUs. Windows, Docker Desktop and an editor hold roughly 3 GB; k6 runs co-located and needs its own ≈ 0.6 GB during a load run. That leaves ≈ 4.3 GB for the Docker stack, so NFR-11 becomes 4.5 GB and §8.3 now assigns every container an explicit limit instead of letting defaults decide.
 
-Throughput is a different kind of number. NFR-11 is a resource you *divide*; NFR-1 and NFR-2 are results the machine *produces*, and no arithmetic on RAM predicts them — the binding constraint is 8 shared cores, with the load generator competing for them. Halving 5,000 to 2,500 would put a guess in the requirements column and make Phase 1 fail acceptance for a reason unrelated to the code. **AC-0.7 measures the hardware ceiling in Phase 0; AC-1.13 sets these two numbers from the real endpoints at checkpoint 1c, and writes them back here.** The latency requirements NFR-3–NFR-6 are unchanged: they are stated *at* NFR-1/NFR-2 load, so they recalibrate automatically with it.
+Throughput is a different kind of number. NFR-11 is a resource you *divide*; NFR-1 and NFR-2 are results the machine *produces*, and no arithmetic on RAM predicts them — the binding constraint is 8 shared cores, with the load generator competing for them. Halving 5,000 to 2,500 would put a guess in the requirements column and make Phase 1 fail acceptance for a reason unrelated to the code. **AC-0.7 measures the hardware ceiling in Phase 0; AC-1.13 sets these two numbers from the real endpoints at checkpoint 1c, and writes them back here.**
+
+**Written back on 2026-09-10 (AC-1.13).** NFR-1 is **550 req/s**, measured against
+`GET /trains/search` and breached at 700. NFR-2 is **≥ 150 req/s** and is a floor
+rather than a value: `hold` showed p99 27 ms against a 150 ms budget at 150 rps,
+and the run stopped because the co-located load generator could not drive more —
+FR-20's 3-hold limit over FR-17's 120 s TTL requires `rate × seconds / 3` distinct
+virtual users, and each k6 VU carries its own JavaScript runtime. Publishing the
+harness's limit as the system's is the fabrication §19.4 exists to prevent, so it
+is recorded as a floor and §19.1's P1 magnitude derives from a floor accordingly. The latency requirements NFR-3–NFR-6 are unchanged: they are stated *at* NFR-1/NFR-2 load, so they recalibrate automatically with it.
 
 Nothing about correctness moves. §14's invariants, INV-11, INV-12, NFR-9 and the whole chaos suite are independent of load magnitude — §1's engineering claim is that allocation stays correct under a spike, not that the spike is a particular size. §19.4's honesty requirements were written for exactly this situation and carry it without amendment.
 

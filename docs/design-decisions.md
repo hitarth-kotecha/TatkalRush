@@ -2648,6 +2648,99 @@ and the durable record have diverged and storing it in one place has failed.
 
 ---
 
+### DD-043 — The load harness is a measuring instrument, and it needed calibrating too
+
+Date: 2026-09-10 · Author: Phase 1c · Phase: 1 · Requirements: FR-51, FR-69, §19.1, §19.4, §19.5, AC-1.13
+Supersedes: —
+
+**Context.**
+
+AC-1.13 asks for two numbers. Getting them required building the k6 harness every
+§19 profile will use, and three separate harness defects each produced a
+*plausible* number before being found:
+
+| Defect | Reported | Actual |
+|---|---:|---:|
+| `SharedArray.indexOf` always `-1`, collapsing load onto one pool | p99 2,768 ms | 50.9 ms |
+| Tokens fetched inside the measurement window | p99 541.8 ms | 21.6 ms |
+| No settle after an inventory reset | p99 307 ms | 17–19 ms |
+
+Every one of them looked like the system's knee. None of them was.
+
+**Decision.**
+
+Four properties are enforced by the harness rather than remembered by whoever runs
+it:
+
+1. **Targets are extracted from the running database**, not written into a script.
+   The seed samples routes at random under a fixed PRNG seed, so they are
+   reproducible but not knowable — and a hard-coded pair keeps returning HTTP 200
+   with an empty train list the day the generator changes.
+2. **Outcomes are classified on the §11.2 error code, never the status.** k6's
+   `http_req_failed` counts any 4xx as a failure, and FR-51 calls
+   `SEAT_UNAVAILABLE` a correct outcome; left alone, a healthy spike reports a 90 %
+   error rate.
+3. **VU count is derived, not chosen.** §19.1 states as an assumption that neither
+   FR-60's rate cap nor FR-20's 3-hold limit binds; it is really a requirement —
+   `VUs ≥ rate × seconds / 3` for holds, and `≥ rate / 5` for the rate cap. The
+   `/5` rather than `/10` is measured: sitting exactly on FR-60's cap tripped it,
+   because a two-bucket sliding window estimates fractionally above the
+   instantaneous rate.
+4. **Every step reports what it actually did** — achieved rate, dropped iterations,
+   distinct pools touched, and the fraction of holds that were real allocations
+   rather than sold-out rejections. Each of those columns exists because its
+   absence hid one of the defects above.
+
+**Alternatives considered.**
+
+1. **Rejected — hard-code a station pair and a schedule id.** The seed is
+   deterministic, so this works today and needs no extraction step. It fails
+   silently rather than loudly: an empty result set is a fast 200, and a profile
+   targeting nothing at full rate looks like excellent throughput.
+
+2. **Rejected — use k6's built-in pass/fail rate and thresholds as the verdict.**
+   Standard practice, and it would let `checks` and `http_req_failed` carry the
+   report. It cannot express FR-51's distinction, which is the one that matters
+   here: the difference between a train being full and the system being broken.
+
+3. **Rejected — pin the hold ramp to one pool, matching NFR-2's "single hot
+   partition" wording.** Literally what §7 asks for. It exhausts ~250 berths in
+   seconds and then times a free-count read returning zero, so it would report the
+   rejection path as write throughput. That measurement is P3's, and P3 exists
+   precisely because it is a different question.
+
+**Consequences.**
+
+NFR-1 is **550 rps** against `search`, reproduced across two runs. NFR-2 is
+**≥ 150 rps** against `hold` and is recorded as a **floor**: p99 was 27 ms against
+a 150 ms budget when the run stopped, and it stopped because 200 rps for 20 s needs
+1,334 VUs, each carrying its own JavaScript runtime, on a box already hosting ten
+containers.
+
+That asymmetry is worth stating plainly. A ceiling the load generator imposed is
+not a property of the system, and NFR-13 forbids estimating how much higher the
+real number is. §19.1's P1 magnitude therefore derives from a floor, and P1's first
+obligation is to report whether it was harness-bound too.
+
+Search is measured with **no locality** — targets spread uniformly across 1,200
+pools — so FR-15's cache hits far less than real traffic would. NFR-1 is
+conservative in the safe direction, and P2 keeps the same uniform spread so the two
+stay comparable.
+
+**What would change this.**
+
+Two levers would lift NFR-2 and both change what is measured, so neither is applied
+without its own entry: shortening `tatkal.hold.ttl` for benchmark runs (which puts
+reaping on the measured path), or moving k6 off-box (which ends NFR-13's
+co-location caveat and every number's comparability with `000-calibration.md`).
+
+The falsifiable form: **if a P1 run at the derived magnitude reports zero dropped
+iterations and a `hold` p99 still far inside NFR-4's 800 ms budget**, then the
+harness — not the system — is still the constraint, and NFR-2 has to be remeasured
+from a load generator that is not sharing eight cores with its subject.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |
