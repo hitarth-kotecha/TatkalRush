@@ -36,7 +36,7 @@ x-app-env: &app-env
   #
   #   TATKAL_CLOCK_OFFSET=P40D docker compose up -d
   TATKALRUSH_CLOCK_OFFSET: ${TATKAL_CLOCK_OFFSET:-PT0S}
-  # FR-17's hold TTL. 120 s in production; ง19's profiles shorten it (DD-044).
+  # FR-17's hold TTL. 120 s in production; ยง19's profiles shorten it (DD-044).
   #
   # FR-20 allows 3 ACTIVE holds per user and a hold stays active for its TTL, so a
   # profile needs rate * ttlSeconds / 3 distinct users. At 120 s, P1 at NFR-2's
@@ -174,15 +174,39 @@ services:
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
       KAFKA_HEAP_OPTS: "-Xms640m -Xmx640m"
     ports: ["9092:9092"]
+    # tini as PID 1. The broker's JVM is otherwise PID 1, and a JVM does not reap
+    # children - every healthcheck left a <defunct> kafka-run-class behind, for as
+    # long as the stack ran.
+    init: true
     healthcheck:
       # A real readiness probe. Kafka accepts TCP connections well before it
       # will serve an API request, so "port is open" is a lie and AC-0.1
       # explicitly rejects a fixed sleep.
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
-      interval: 5s
+      #
+      # But the probe is a JVM, and it was the most expensive thing in the stack.
+      # kafka-run-class.sh reads the SAME KAFKA_HEAP_OPTS as the broker, so every
+      # check launched a second JVM asking for a 640 MB heap inside this 1 GiB
+      # container, with G1 and full tiered compilation: 2.3-3.6 CPU-seconds per
+      # probe, every ~7 s. Idle, this container averaged 45.8% of a core (p90
+      # 180%), and during P1 it peaked at 548% - more than both app replicas -
+      # while doing nothing at all. That is noise under every benchmark, and it
+      # coincided with 3 s GC pauses in the replicas on a cold run.
+      #
+      # So the probe gets its own small JVM (1.4-1.7 CPU-s, 48 MB), and runs every
+      # 30 s once healthy instead of every 5. start_interval keeps startup
+      # detection fast - Docker probes every 2 s until the first success - so
+      # AC-0.1's cold start is not paying for the steady-state saving.
+      test:
+        - CMD-SHELL
+        - >-
+          KAFKA_HEAP_OPTS='-Xms16m -Xmx48m'
+          KAFKA_JVM_PERFORMANCE_OPTS='-XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1'
+          /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1
+      interval: 30s
+      start_interval: 2s
+      start_period: 120s
       timeout: 10s
-      retries: 24
-      start_period: 20s
+      retries: 3
 
   # --- application ----------------------------------------------------------
 

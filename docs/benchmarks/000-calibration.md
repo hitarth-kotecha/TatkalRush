@@ -135,6 +135,13 @@ The harness now enforces a warmup, voids any step that drops iterations rather
 than annotating it (SDD §19.5's rule one layer down), and stops at the first
 breach.
 
+**Found after publication (2026-09-13).** Kafka's healthcheck was a JVM launched
+every ~7 s with the broker's 640 MB heap — 2.3–3.6 CPU-seconds per probe, an idle
+Kafka container averaging 45.8 % of a core. It was running throughout this
+calibration on the same 8 cores, and it is a candidate cause for the non-monotonic
+p99 above. Fixed in [DD-047](../design-decisions.md#dd-047); the ceiling here is
+conservative by an unmeasured amount.
+
 ---
 
 ## Consequence: OQ-2, resolved

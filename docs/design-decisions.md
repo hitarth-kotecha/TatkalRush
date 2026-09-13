@@ -3038,6 +3038,83 @@ still not keeping up, and discovery or batching is the bottleneck.
 
 ---
 
+### DD-047 — Kafka's healthcheck gets its own small JVM, and runs every 30 s once healthy
+
+Date: 2026-09-13 · Author: Phase 1c · Phase: 1 · Requirements: AC-0.1, NFR-11, NFR-12, NFR-13
+Supersedes: —
+
+**Context.**
+
+The first P1 run after the replicas restarted reported hold p50 2,146 ms, p99
+10,092 ms and 161 failures at 60 rps. The replicas showed Serial young-generation GC
+pauses of up to **3.25 s**, which is not what a 320 MB heap does unless its GC
+thread cannot get a CPU — and Kafka's own log recorded its in-process controller
+heartbeat timing out during the run, which only happens when the whole Docker VM is
+starved.
+
+Sampling every container once a second through a P1 run found the largest CPU
+consumer in the stack was **Kafka**, which nothing uses until Strategy B: median
+40 %, p90 225 %, peak **548 %** — against 144 % for the busiest app replica.
+
+The cause was its healthcheck. `kafka-broker-api-versions.sh` is a JVM tool, and
+`kafka-run-class.sh` reads the same `KAFKA_HEAP_OPTS` as the broker, so every probe
+launched a second JVM requesting a **640 MB heap** inside a 1 GiB container, with G1
+and full tiered compilation. Measured inside the container: **2.3–3.6 CPU-seconds per
+probe**, about 2 s wall, every ~7 s. Each also left a `<defunct>` process, because the
+broker's JVM is PID 1 and does not reap children.
+
+**Decision.**
+
+- The probe stays a real Kafka API call, run with `KAFKA_HEAP_OPTS='-Xms16m -Xmx48m'`
+  and `-XX:+UseSerialGC -XX:TieredStopAtLevel=1 -XX:CICompilerCount=1`: 1.4–1.7
+  CPU-seconds, and it still exits 1 against a closed port.
+- `interval: 30s` once healthy, `start_interval: 2s` until the first success
+  (Docker Engine 25+), so cold-start detection stays fast.
+- `init: true`, so tini is PID 1 and reaps.
+- `run-profile.sh` warms up for 30 s before resetting inventory — AC-0.7's rule 1,
+  which the profile driver had never enforced.
+
+**Alternatives considered.**
+
+1. **Rejected — a TCP port check.** Kafka accepts connections before it serves
+   requests; AC-0.1 calls that probe a lie, and Compose would release the apps
+   against a broker that cannot answer them.
+2. **Rejected — remove the healthcheck.** The replicas `depends_on` Kafka being
+   healthy, and chaos C4 needs to see the broker blink.
+3. **Rejected — drop Kafka from the stack until Phase 2.** NFR-11's budget and
+   every benchmark's comparability are defined against §8.3's full stack.
+4. **Rejected — a probe written against the wire protocol with `nc`.** Cheap, and a
+   hand-rolled binary ApiVersions request is the kind of thing that breaks silently
+   on a broker upgrade.
+
+**Consequences.**
+
+Idle Kafka, 40 samples: **mean 45.8 % → 8.4 %, p90 180 % → 2.9 %**, zombies 2 → 0.
+Probes observed every ~2 s until healthy, then every 30 s.
+
+The same P1 (60 rps) against freshly restarted replicas, now warmed and without the
+tax: **hold p50 7.2 ms, p95 13.0 ms, p99 30.5 ms**, no failures, valid under §19.5.
+The warm run before the fix had p99 282 ms.
+
+**Every earlier benchmark ran under the tax** — AC-0.7's 750 rps and AC-1.13's
+NFR-1 and NFR-2. Both reports now say so. The bias is towards worse latency, so
+those numbers are conservative, but by an amount nobody measured, and §9.4 should
+not be compared against them without a re-run.
+
+A dead broker now takes up to 90 s to be marked unhealthy (3 × 30 s) rather than two
+minutes of 5 s probes. Nothing routes on Kafka's health after startup, so that
+costs detection latency in C4's report and nothing else.
+
+**What would change this.**
+
+When Strategy B puts real traffic through Kafka, the probe's cost becomes small next
+to the broker's own, and the question becomes whether 30 s is too slow for C4. The
+falsifiable form: **if an idle stack's Kafka container again averages more than
+15 % of a core**, something else is taxing the benchmark and this entry has not
+found all of it.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |

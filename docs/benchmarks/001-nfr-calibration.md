@@ -194,6 +194,18 @@ otherwise identical runs. The knee is real; its exact position is ±1 step.
 this run. Before C5 puts real traffic through it, that headroom needs revisiting or
 an OOM kill will present as a PSP outage.
 
+**Found after publication (2026-09-13): the stack was taxing its own measurement.**
+Kafka's healthcheck launched a JVM every ~7 s that inherited the broker's 640 MB
+heap and cost 2.3–3.6 CPU-seconds per probe. Idle, the Kafka container averaged
+45.8 % of a core with a p90 of 180 %, while nothing used Kafka at all; during a P1
+run it peaked at 548 %. Every number in this report was taken under that load. It
+was fixed in [DD-047](../design-decisions.md#dd-047) — idle mean 8.4 %, p90 2.9 % —
+and the effect on a tail is not small: an identical P1 run's hold p99 went from
+282 ms to 30.5 ms. The direction is known (the tax inflates latency, so NFR-1 and
+NFR-2 here are conservative); the magnitude for these endpoints is not, and NFR-13
+forbids guessing it. **Both should be re-measured before §9.4 compares anything
+against them.**
+
 ---
 
 ## Memory (NFR-11), sampled after the run
