@@ -3115,6 +3115,74 @@ found all of it.
 
 ---
 
+### DD-048 — A run during which the host was paging is invalid
+
+Date: 2026-09-13 · Author: Phase 1c · Phase: 1 · Requirements: NFR-12, NFR-13, §19.5, AC-1.2
+Supersedes: —
+
+**Context.**
+
+With Kafka's tax gone (DD-047), P1 at 60 rps was valid; at 150 rps and at 100 rps
+it collapsed — p95 16–19 s, 2,041 and 1,249 failures, replica GC pauses of **24.95 s
+and 15.9 s**, and nginx marking both replicas dead and answering 1,758 requests
+"no live upstreams". The invariants passed throughout: slow, never wrong.
+
+Nothing inside the stack explained a 25-second Serial collection of a 320 MB heap.
+The app cgroups showed no swap, no `memory.max` events, no OOM, and a few dozen major
+faults. The Windows host did: **7.9 GB of RAM, 14.7 GB committed**, and Docker's VM
+(`vmmem`) holding 4.1 GB private with only **2.07 GB resident** — half of the VM's
+memory already in the pagefile at idle. Sampled once a second through the 100 rps
+run, hard page-ins rose from 40–100/s to a sustained **1,300–1,900/s**. k6 itself
+peaked at 409 MB. When load touches guest memory the host is holding on disk, the
+guest stalls with no way to see why, and a JVM reports it as a GC pause.
+
+That is the likeliest reason AC-1.13 reached 150 rps on 2026-09-10 and P1 could not
+today: the laptop had more free RAM that day, and nothing recorded it.
+
+**Decision.**
+
+`run-profile.sh` samples the host's `Pages Input/sec` and `Available MBytes` for
+exactly the k6 window, folds p50, p90 and the minimum into the result JSON, prints
+them with the run, and **voids a run whose p90 exceeds 1,000 page-ins/s**.
+
+**Alternatives considered.**
+
+1. **Rejected — shrink the WSL VM in `.wslconfig`.** A smaller VM with guest swap
+   would let the guest kernel choose what to evict (page cache before heap), a
+   better policy than the host's. It is a change to the user's system
+   configuration, it changes NFR-11's measurement, and it hides rather than reports
+   a host that is short of memory.
+2. **Rejected — only record the numbers.** Metadata nobody is forced to read is
+   the state that let AC-1.13's 150 rps and today's collapse coexist unexplained.
+3. **Rejected — void on host available memory.** Available memory is what Windows
+   is willing to hand out after trimming; paging is the cost actually paid.
+
+**Consequences.**
+
+The rule's first real decision voided a run that met every latency budget: P1 at
+60 rps, 0 failures, hold p99 115 ms against NFR-4's 800 — with page-ins at p90 1,314
+and 700 MB available. The same profile at the same rate earlier that day, on a host
+with more headroom, had p99 **30.5 ms**. Paging had already made the tail 3.8× worse
+without breaking anything, and a report cannot tell 115 ms of system from 115 ms of
+pagefile. That is the case the rule is for.
+
+**On this laptop, in the state measured, no P1 rate currently produces a publishable
+run.** The next step is outside the repository: free host memory and re-run, and let
+the page-in columns show whether it worked.
+
+Windows only. On a Linux host the containers are not inside a VM the host can page
+behind the guest's back, and the columns read "not sampled".
+
+**What would change this.**
+
+If k6 moves off-box (NFR-13), the host running the stack stops sharing memory with
+the load generator and this rule should fire far less — it should still run. The
+falsifiable form: **if a run with host page-ins p90 below 100/s still shows replica
+GC pauses above 1 s**, the pauses are not the pagefile, and this entry has
+misattributed them.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |
