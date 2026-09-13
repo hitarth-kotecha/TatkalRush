@@ -15,6 +15,7 @@ Maven phases couples unrelated builds and defeats Docker layer caching for both.
 | `calibration/nfr-ramp.js` | AC-1.13's ramp against `search` and `hold` |
 | `calibration/run-nfr-calibration.sh` | Driver: steps the rate, finds the knee, voids bad steps |
 | `lib/preflight.sh` | Refuses to measure unless every request through nginx reaches a booking replica (DD-045) |
+| `lib/host-paging.ps1` | Samples the Windows host's hard page-ins during a run; heavy paging voids it |
 | `profiles/p1-tatkal-spike.js` | §19.1 P1: ramp to `PEAK_RPS` of TATKAL holds on the one open date |
 | `profiles/p2-sustained-mixed.js` | §19.1 P2: `RATE` sustained, 90 % search / 10 % hold |
 | `run-profile.sh` | Driver: preflight → warm-up → reset → run → **drain** → §14 → §19.5 verdict |
@@ -48,11 +49,15 @@ first is a **harness** property, not a system one: it means requests were refuse
 at the edge before reaching the system under test, so any throughput figure
 describes load that was never served.
 
-`run-profile.sh` adds four of the same class, each learned from a run that looked
+`run-profile.sh` adds five of the same class, each learned from a run that looked
 fine until it was examined: **any `TOO_MANY_HOLDS`** (FR-20 refused load the harness
-shaped), **any dropped iteration**, **any request failure**, and **a system that did
+shaped), **any dropped iteration**, **any request failure**, **a system that did
 not drain** within TTL + 60 s after the run — because then the quiesced invariants
-were asked about a live system.
+were asked about a live system — and **a host that was paging** (p90 above 1,000
+hard page-ins/s during the run, Windows only). Docker Desktop's VM is a Windows
+process, and when the laptop runs short of RAM its memory — including the replicas'
+Java heaps — is read back from the pagefile. The guest sees nothing; its JVMs report
+multi-second GC pauses. Close memory-hungry applications before a benchmark run.
 
 The VU count is what prevents the first of those, and it is derived rather than
 chosen:

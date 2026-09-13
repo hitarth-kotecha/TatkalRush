@@ -139,10 +139,44 @@ echo "done"
 echo
 echo " running..."
 OUT_JSON="$RESULTS/${PROFILE}-${RUN_ID}.json"
+
+# Host paging, sampled for exactly the measured window (lib/host-paging.ps1 says
+# why). Windows only: on a Linux host the stack is not inside a VM the host can
+# page out behind the guest's back, and the columns are reported as unavailable.
+HOST_CSV="$RESULTS/${PROFILE}-${RUN_ID}-host.csv"
+HOST_STOP="$RESULTS/.${PROFILE}-${RUN_ID}.stop"
+HOST_SAMPLER=""
+if command -v powershell.exe >/dev/null 2>&1; then
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$HERE/lib/host-paging.ps1")" \
+    -Out "$(cygpath -w "$HOST_CSV")" -StopFile "$(cygpath -w "$HOST_STOP")" >/dev/null 2>&1 &
+  HOST_SAMPLER=$!
+fi
+
 RUN_ID="$RUN_ID" BASE_URL="$BASE" HOLD_TTL_SECONDS="$HOLD_TTL_SECONDS" OUT="$OUT_JSON" \
   "$K6" run --quiet "$SCRIPT" 2>/dev/null | tail -1 > /dev/null
 
+if [ -n "$HOST_SAMPLER" ]; then
+  touch "$HOST_STOP"; wait "$HOST_SAMPLER" 2>/dev/null; rm -f "$HOST_STOP"
+fi
+
 [ -s "$OUT_JSON" ] || { echo " k6 produced no result" >&2; exit 1; }
+
+# Folded into the result JSON, so the numbers travel with the run (NFR-12).
+python - "$OUT_JSON" "$HOST_CSV" <<'ENDPY'
+import csv, json, os, sys
+out, host = sys.argv[1], sys.argv[2]
+d = json.load(open(out))
+if os.path.exists(host):
+    rows = [r for r in csv.DictReader(open(host, encoding="ascii", errors="ignore")) if r.get("pagesInPerSec", "").strip()]
+    pin = sorted(int(r["pagesInPerSec"]) for r in rows)
+    avail = [int(r["availableMB"]) for r in rows]
+    if pin:
+        d["host_samples"] = len(pin)
+        d["host_page_ins_p50"] = pin[len(pin) // 2]
+        d["host_page_ins_p90"] = pin[int(len(pin) * 0.9)]
+        d["host_available_mb_min"] = min(avail)
+json.dump(d, open(out, "w"), indent=2)
+ENDPY
 
 python - "$OUT_JSON" <<'ENDPY'
 import json, sys
@@ -169,6 +203,11 @@ rows += [
     ("RATE_LIMITED", d.get("rate_limited", 0)),
     ("failures", d.get("failures", 0)),
 ]
+if "host_page_ins_p50" in d:
+    rows.append(("host page-ins/s p50/p90", "%d / %d" % (d["host_page_ins_p50"], d["host_page_ins_p90"])))
+    rows.append(("host available MB min", d["host_available_mb_min"]))
+else:
+    rows.append(("host paging", "not sampled (non-Windows host)"))
 for k, v in rows:
     print("   %-22s %s" % (k, v))
 ENDPY
@@ -258,6 +297,24 @@ if d.get("dropped_iterations", 0) > 0:
 if d.get("failures", 0) > 0:
     reasons.append("%d request failures (5xx, timeouts, or unclassified codes)"
                    % d["failures"])
+# The laptop's pagefile, not the system. See lib/host-paging.ps1.
+#
+# Measured on the reference laptop (7.9 GB): idle host 0-135 page-ins/s; P1 at
+# 100 rps sustaining 1,300-1,900 while replica GC pauses reached 16 s and 1,249
+# requests failed. And the case that decided the threshold: P1 at 60 rps with p90
+# 1,314 and 700 MB available met EVERY latency budget - 0 failures, p99 115 ms
+# against NFR-4's 800 - and was voided by this rule. Correctly: the same run with
+# more host headroom earlier the same day had p99 30.5 ms. Paging had already made
+# the tail 3.8x worse without breaking anything, which is exactly when a guard has
+# to fire, because a report cannot tell 115 ms of system from 115 ms of pagefile.
+# p90, not max, so a single antivirus scan does not void a run.
+HOST_PAGING_P90_LIMIT = 1000
+if d.get("host_page_ins_p90", 0) > HOST_PAGING_P90_LIMIT:
+    reasons.append(
+        "the HOST was paging: %d hard page-ins/s at p90 (limit %d), minimum %d MB "
+        "available. Docker's VM was being read back from the Windows pagefile, so "
+        "latency here is disk I/O on the laptop - free host RAM and re-run"
+        % (d["host_page_ins_p90"], HOST_PAGING_P90_LIMIT, d.get("host_available_mb_min", -1)))
 
 if reasons:
     print(" RUN IS INVALID (§19.5). No report may be generated from it.")
