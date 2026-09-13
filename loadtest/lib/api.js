@@ -191,6 +191,49 @@ export function generalTarget(iteration) {
   return generalOnly[spreadIndex(iteration, generalOnly.length)];
 }
 
+/**
+ * TATKAL pools on the one journey date whose window is open.
+ *
+ * <h3>Why a single date, and why it is passed in</h3>
+ *
+ * <p>FR-28 opens a Tatkal window at 10:00 (AC) or 11:00 (sleeper) IST on D-1. Under
+ * a clock offset the system stands at one instant, so exactly one journey date in
+ * the seeded window is open at a time: at P40D the system is on 2026-10-20 and only
+ * 2026-10-21's Tatkal is unlocked. Every other date answers QUOTA_LOCKED before the
+ * allocator is reached, and a spike of those measures a clock comparison.
+ *
+ * <p>The date is passed rather than computed here because the window rule lives in
+ * the domain (TatkalWindow) and reimplementing IST arithmetic in JavaScript would
+ * be a second definition of FR-28 that drifts.
+ *
+ * <p>The small target set is a FEATURE for P1. FR-9 sizes a Tatkal pool at
+ * ceil(0.10 x capacity), so one date's Tatkal inventory is roughly a thousand
+ * berths against thousands of attempts - which is what a Tatkal spike is, and what
+ * makes SEAT_UNAVAILABLE the majority outcome rather than a defect (FR-51).
+ */
+const tatkalPools = new SharedArray('tatkal', function () {
+  const doc = JSON.parse(open('../targets.json'));
+  const date = __ENV.TATKAL_DATE || '';
+  const pools = doc.targets.filter(function (t) {
+    return t.quota_type === 'TATKAL' && (date === '' || t.journey_date === date);
+  });
+  if (pools.length === 0) {
+    throw new Error(
+      `no TATKAL targets for date "${date}". P1 needs an open window (AC-1.11): ` +
+        'start the stack with TATKAL_CLOCK_OFFSET and pass the matching TATKAL_DATE.',
+    );
+  }
+  return pools;
+});
+
+export function tatkalTarget(iteration) {
+  return tatkalPools[spreadIndex(iteration, tatkalPools.length)];
+}
+
+export function tatkalPoolCount() {
+  return tatkalPools.length;
+}
+
 // ── requests ────────────────────────────────────────────────────────────────
 
 export function search(target) {

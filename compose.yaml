@@ -36,6 +36,15 @@ x-app-env: &app-env
   #
   #   TATKAL_CLOCK_OFFSET=P40D docker compose up -d
   TATKALRUSH_CLOCK_OFFSET: ${TATKAL_CLOCK_OFFSET:-PT0S}
+  # FR-17's hold TTL. 120 s in production; §19's profiles shorten it (DD-044).
+  #
+  # FR-20 allows 3 ACTIVE holds per user and a hold stays active for its TTL, so a
+  # profile needs rate * ttlSeconds / 3 distinct users. At 120 s, P1 at NFR-2's
+  # 150 rps floor needs 6,000 - more than FR-69 seeds - and P2 at 550 rps needs
+  # 2,200 k6 VUs, which is more JavaScript runtimes than this box has memory for.
+  #
+  #   TATKAL_HOLD_TTL_MS=15000 docker compose up -d
+  TATKALRUSH_HOLD_TTLMS: ${TATKAL_HOLD_TTL_MS:-120000}
 
 x-app-base: &app-base
   build:

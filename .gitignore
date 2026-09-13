@@ -29,3 +29,4 @@ Thumbs.db
 # exist while looking perfectly healthy.
 loadtest/targets.json
 dependency-reduced-pom.xml
+loadtest/results/

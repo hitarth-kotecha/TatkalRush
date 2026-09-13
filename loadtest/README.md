@@ -14,6 +14,11 @@ Maven phases couples unrelated builds and defeats Docker layer caching for both.
 | `calibration/http-ceiling.js` | AC-0.7's Phase 0 ramp against `/actuator/health` |
 | `calibration/nfr-ramp.js` | AC-1.13's ramp against `search` and `hold` |
 | `calibration/run-nfr-calibration.sh` | Driver: steps the rate, finds the knee, voids bad steps |
+| `lib/preflight.sh` | Refuses to measure unless every request through nginx reaches a booking replica (DD-045) |
+| `profiles/p1-tatkal-spike.js` | §19.1 P1: ramp to `PEAK_RPS` of TATKAL holds on the one open date |
+| `profiles/p2-sustained-mixed.js` | §19.1 P2: `RATE` sustained, 90 % search / 10 % hold |
+| `run-profile.sh` | Driver: preflight → warm-up → reset → run → **drain** → §14 → §19.5 verdict |
+| `results/` | Per-run JSON. Not committed. |
 | `targets.json` | Generated. Not committed — it describes one seeded database. |
 
 ## The four rules a step is void under
@@ -43,16 +48,32 @@ first is a **harness** property, not a system one: it means requests were refuse
 at the edge before reaching the system under test, so any throughput figure
 describes load that was never served.
 
-The VU count is what prevents it, and it is derived rather than chosen:
+`run-profile.sh` adds four of the same class, each learned from a run that looked
+fine until it was examined: **any `TOO_MANY_HOLDS`** (FR-20 refused load the harness
+shaped), **any dropped iteration**, **any request failure**, and **a system that did
+not drain** within TTL + 60 s after the run — because then the quiesced invariants
+were asked about a live system.
+
+The VU count is what prevents the first of those, and it is derived rather than
+chosen:
 
 ```
-VUs  >=  rate / 5                 FR-60's 10 rps per-user cap, with headroom
-VUs  >=  rate * seconds / 3       FR-20's 3 active holds, over FR-17's 120 s TTL
+VUs  >=  rate / 5                        FR-60's 10 rps per-user cap, with headroom
+VUs  >=  rate * ttlSeconds / 3 * 1.5     FR-20's 3 active holds, with headroom (DD-044)
 ```
 
-The second dominates by two orders of magnitude and is the reason `hold` cannot
-currently be ramped past 150 rps on this machine — see
-`docs/benchmarks/001-nfr-calibration.md`.
+The second dominates. At FR-17's 120 s it is why `hold` could not be ramped past
+150 rps (`docs/benchmarks/001-nfr-calibration.md`), and why the profiles run against
+a stack started with `TATKAL_HOLD_TTL_MS=15000` (DD-044). The driver reads the TTL
+from the running container rather than trusting its own environment.
+
+## Quiesced means drained, not "waited a while"
+
+INV-5, INV-8 and INV-12 compare Redis with Postgres, and a live hold makes them
+disagree legitimately. So after a profile the driver **waits for §13.2's reaper**
+until no `holds:` key and no `HELD` booking remain, and reports how long that took.
+It used to sleep and then "nudge" lazy reaping with a burst of holds — which only
+touched the pools it booked from, and left live holds of its own for INV-8 to find.
 
 ## Running
 
@@ -61,4 +82,19 @@ See `docs/runbook.md` for bringing the stack up, seeding, and warming Redis. The
 ```bash
 ./loadtest/extract-targets.sh
 ./loadtest/calibration/run-nfr-calibration.sh
+```
+
+The profiles need an open Tatkal window and the benchmark TTL, set when the stack
+starts (`TATKAL_REDIS_PORT` only if Windows has reserved 6379 — see the runbook):
+
+```bash
+TATKAL_CLOCK_OFFSET=P40D TATKAL_HOLD_TTL_MS=15000 docker compose up -d --wait
+```
+
+```bash
+PEAK_RPS=60 ./loadtest/run-profile.sh p1
+```
+
+```bash
+RATE=550 ./loadtest/run-profile.sh p2
 ```

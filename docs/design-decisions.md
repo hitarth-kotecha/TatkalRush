@@ -2741,6 +2741,78 @@ from a load generator that is not sharing eight cores with its subject.
 
 ---
 
+### DD-044 — Benchmark runs shorten the hold TTL to 15 s, and say so
+
+Date: 2026-09-13 · Author: Phase 1c · Phase: 1 · Requirements: FR-17, FR-20, FR-69, §19.1, §19.5, NFR-13
+Supersedes: —
+
+**Context.**
+
+FR-20 allows three *active* holds per user, and a hold is active for its TTL. §19.1
+requires one k6 VU per user. So a profile making holds at `rate` needs
+
+```
+users  ≥  rate × ttlSeconds / 3
+```
+
+At FR-17's 120 s that is **6,000 users for P1** at NFR-2's 150 rps floor — more
+than the 5,000 FR-69 seeds — and **2,200 VUs for P2** at 550 rps with a 10 % write
+share. Each VU is its own JavaScript runtime on the same eight cores as the system
+(NFR-13), and AC-1.13 already dropped iterations at 1,334.
+
+The inequality is also a mean. k6 hands an iteration to whichever VU is free, and
+sized exactly to it, the first correctly-routed P1 run got 62 `TOO_MANY_HOLDS` from
+users taking a fourth hold a few milliseconds early.
+
+**Decision.**
+
+- Benchmark stacks run with `TATKAL_HOLD_TTL_MS=15000`. Production and every test
+  keep FR-17's 120 s.
+- Profiles size users at `rate × ttl / 3 × 1.5`.
+- `run-profile.sh` reads the TTL **from the running app container**, not from its
+  own environment, and passes it to k6 and to the invariant checker.
+- A run with any `TOO_MANY_HOLDS` is invalid, on the same reasoning §19.5 applies to
+  `RATE_LIMITED`: the load was shaped by the harness's user count.
+- Every benchmark report states the TTL in its metadata.
+
+**Alternatives considered.**
+
+1. **Rejected — seed more users.** FR-69's 5,000 is a floor, but changing the seed
+   changes FR-50's byte-identical dataset, and with it the comparability of every
+   committed benchmark.
+2. **Rejected — raise FR-20's limit for benchmarks.** That changes the booking rule
+   under test. A profile that exercises a different admission rule from production
+   is measuring a different system.
+3. **Rejected — decouple VUs from users** (a small VU pool cycling through all 5,000
+   tokens). It fixes the k6 memory problem, since VUs would only need to cover
+   concurrency — but §19.1 mandates 1 VU : 1 user, and P1 at 150 rps would still
+   need 6,000 users at 120 s.
+4. **Rejected for now — k6 on a second machine.** Removes NFR-13's co-location
+   caveat, and ends every number's comparability with `000` and `001`.
+
+**Consequences.**
+
+**Reaping moves inside the measured window.** At 120 s a 50-second spike never sees
+a hold expire; at 15 s the lazy reap in `allocate.lua` and §13.2's background sweep
+both run throughout. Latencies include that cost, which is arguably more honest
+about a real Tatkal morning — and it is certainly different, so a 15 s number is not
+a 120 s number.
+
+**Contention changes shape.** Berths return every 15 s, so a Tatkal pool that would
+have stayed sold out for two minutes reopens repeatedly, and the
+`SEAT_UNAVAILABLE` share depends on the TTL. §9.4's comparison stays controlled only
+if both strategies run at the same TTL, which the harness now enforces by reading it
+from the system.
+
+**What would change this.**
+
+If users can be provisioned for a 120 s run — off-box k6, or a seed that grows
+without breaking FR-50 — run P1 at both TTLs. The falsifiable form: **if hold p99 at
+120 s differs from 15 s by more than run-to-run noise**, reaping cost is material,
+and 15 s results must not be quoted as NFR-4 evidence.
+
+---
+
 ### DD-045 — nginx re-resolves its upstreams at runtime
 
 Date: 2026-09-13 · Author: Phase 1c · Phase: 1 · Requirements: §8.3, §19.5, AC-1.2
