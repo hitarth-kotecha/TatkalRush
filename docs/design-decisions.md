@@ -2741,6 +2741,104 @@ from a load generator that is not sharing eight cores with its subject.
 
 ---
 
+### DD-045 — nginx re-resolves its upstreams at runtime
+
+Date: 2026-09-13 · Author: Phase 1c · Phase: 1 · Requirements: §8.3, §19.5, AC-1.2
+Supersedes: —
+
+**Context.**
+
+The first P1 run reported roughly half its requests as failures. Every one was a
+404 with Spring's default error body, from a path — `POST /api/v1/bookings/hold` —
+that both replicas served correctly when called directly. nginx was healthy, all
+three app-image containers were healthy, and nothing logged an error.
+
+The 404s came from **psp-sim**. Its actuator counted 3,202 of them, and it runs the
+same image under a profile that has no booking routes. nginx's configuration never
+names psp-sim.
+
+The mechanism is two ordinary behaviours meeting:
+
+- **nginx resolves `server` hostnames once, when it loads its configuration**, and
+  proxies to those addresses until it is reloaded.
+- **Docker assigns a container's IP when it starts, not when it is created.** The
+  app replicas carry `restart: unless-stopped`; nginx does not. A crash loop, an
+  engine restart, or `docker compose up -d app-1 app-2` — which this project's own
+  runbook told the reader to run, to apply the clock offset — moves the replicas
+  and leaves nginx behind. When psp-sim started first, it took an address nginx
+  still believed was `app-2`.
+
+Reproduced deterministically: stop the three app-image containers, start psp-sim
+before the replicas, and 10 of 20 searches through nginx return 404 while
+`getent hosts app-2` inside the nginx container returns the correct, new address.
+
+**Decision.**
+
+The upstream re-resolves through Docker's embedded DNS:
+
+```nginx
+resolver 127.0.0.11 valid=2s ipv6=off;
+upstream tatkal_app {
+    zone tatkal_app 64k;
+    server app-1:8080 resolve max_fails=3 fail_timeout=5s;
+    server app-2:8080 resolve max_fails=3 fail_timeout=5s;
+    keepalive 128;
+}
+```
+
+`resolve` on an upstream server has been in open-source nginx since 1.27.3; the
+pinned image is 1.27.5. The `zone` is required, because re-resolved addresses must
+be visible to every worker process.
+
+Every driver that measures through nginx now runs `routing_preflight` first:
+eight paced searches, all of which must return 200. Search is the probe because
+only the booking role serves it — psp-sim answers 404, a dead replica 502.
+
+**Alternatives considered.**
+
+1. **Rejected — `set $backend app-1; proxy_pass http://$backend;`.** The standard
+   pre-1.27.3 idiom, and it re-resolves. It gives up the `upstream` block, and with
+   it the round-robin across two replicas, `keepalive 128`, and `max_fails` — the
+   first of which is the whole reason nginx is in the stack.
+
+2. **Rejected — `depends_on: {app-1: {condition: service_healthy, restart: true}}`.**
+   Restarts nginx when Compose recreates a replica. It does nothing when the
+   *daemon* restarts one, which is the crash-loop and engine-restart case, and
+   the one that actually occurred.
+
+3. **Rejected — fixed `ipv4_address` per service.** Correct, and it hardcodes a
+   subnet that can collide with another machine's networks. It also hides the
+   dependency rather than handling it: the next service added without an address
+   reintroduces the failure.
+
+4. **Rejected — a runbook line: "restart nginx after recreating the apps".** A
+   procedure for a failure that produces no error. It is the kind of step that is
+   skipped exactly once, and that once costs a run.
+
+**Consequences.**
+
+Verified: after the change, two IP shuffles with no reload gave 0 of 20 404s.
+Mutation: removing `resolve` and forcing psp-sim onto a stale address makes the
+preflight fail 4 of 8 with 404, and the run refuses to start.
+
+DNS cost is one query per name every two seconds, against a proxy handling
+hundreds of requests per second.
+
+The window is not zero. For up to `valid=2s` after a replica moves, nginx can still
+send to the old address. A replica that restarts is unhealthy for its 40 s start
+period anyway, so any request in that window was going to fail regardless; the
+defect this closes is the one that lasted **forever**.
+
+**What would change this.**
+
+If nginx is replaced — by a Compose-native balancer, or by running the replicas as
+`deploy.replicas: 2` behind Docker's DNS round-robin — the problem moves with it
+and has to be re-examined, not assumed solved. The falsifiable form: **if a
+`routing_preflight` ever fails with 404 on a stack whose nginx carries `resolve`**,
+re-resolution is not doing what this entry claims.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |

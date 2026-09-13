@@ -45,7 +45,8 @@ The `java -cp` form above needs no plugin and no installed artifacts.
 ## 4. Provision Redis — **this step is not optional**
 
 ```bash
-java -cp "<same classpath plus allocator-redis, application, lettuce, netty, reactor>" io.tatkalrush.ops.warmup.PoolWarmupMain "jdbc:postgresql://localhost:5432/tatkal" tatkal tatkal localhost 6379
+mvn -B -o -q package -DskipTests -pl ops/pool-warmup,ops/invariant-checker -am
+java -jar ops/pool-warmup/target/pool-warmup.jar "jdbc:postgresql://localhost:5432/tatkal" tatkal tatkal localhost ${TATKAL_REDIS_PORT:-6379}
 ```
 
 ~8.4 s for 3,600 pools / 291,120 berth slots.
@@ -76,6 +77,36 @@ day: sleeper TATKAL opens 11:00 IST on D-1, AC at 10:00 IST. `P40D` from
 
 The app logs a `WARN` at startup whenever the offset is non-zero. If you do not
 see it, the offset did not reach the container.
+
+Recreating only the replicas used to be dangerous. It moves their IP addresses,
+and nginx kept proxying to the old ones — one of which psp-sim then took. Half of
+every request answered 404 from a healthy container. nginx now re-resolves
+(DD-045), and every load driver runs `routing_preflight` before measuring.
+
+---
+
+## When the stack will not start, or measures nonsense
+
+**`ports are not available ... 6379 ... forbidden by its access permissions`.**
+Windows reserved a port block containing 6379 at boot. Check with
+`netsh interface ipv4 show excludedportrange protocol=tcp`. The blocks are chosen
+afresh on each boot, so rather than fighting them, move the host side:
+
+```bash
+TATKAL_REDIS_PORT=7379 docker compose up -d --wait
+```
+
+Export the same variable for `loadtest/run-profile.sh` and the calibration driver;
+they pass it to the warm-up and the invariant checker. The apps are unaffected —
+they reach Redis inside the Compose network.
+
+**Every container exited with code 255.** The Docker engine itself restarted. Only
+the app-image services have a restart policy, so they come back — into a stack with
+no Postgres or Redis — and crash-loop until `docker compose up -d --wait` brings the
+rest back.
+
+**`routing_preflight` fails with 404.** A request reached a container without
+booking routes. Check nginx still carries `resolve` on both upstream servers.
 
 ---
 

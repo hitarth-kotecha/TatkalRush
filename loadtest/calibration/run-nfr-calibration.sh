@@ -69,8 +69,11 @@ reset_inventory() {
   docker compose exec -T postgres psql -U tatkal -d tatkal -q -c \
     "TRUNCATE ledger_entries, refunds, payment_events, payments, seat_allocations,
      passengers, bookings RESTART IDENTITY CASCADE" >/dev/null 2>&1
+  # Checked, not discarded: a warm-up that cannot reach Redis leaves the previous
+  # step's depleted masks in place, and the next step measures SEAT_UNAVAILABLE.
   java -jar "$ROOT/ops/pool-warmup/target/pool-warmup.jar" \
-    "jdbc:postgresql://localhost:5432/tatkal" tatkal tatkal localhost 6379 >/dev/null 2>&1
+    "jdbc:postgresql://localhost:5432/tatkal" tatkal tatkal localhost "${TATKAL_REDIS_PORT:-6379}" \
+    >/dev/null 2>&1 || { echo "pool warm-up FAILED - is TATKAL_REDIS_PORT right?" >&2; exit 1; }
 }
 
 measure() {  # endpoint budget_ms rates...
@@ -208,6 +211,13 @@ echo
 echo " AC-0.7 measured 750 rps against /actuator/health/liveness, with no domain"
 echo " work in the path. These endpoints do real work and will be a FRACTION of"
 echo " that. The ratio is the cost of the domain path (§9.4)."
+echo
+
+# shellcheck source=../lib/preflight.sh
+. "$ROOT/loadtest/lib/preflight.sh"
+printf ' routing preflight... '
+routing_preflight "$BASE" "$ROOT" || exit 1
+echo "ok"
 
 measure "search" 50 $SEARCH_RATES
 measure "hold" 150 $HOLD_RATES

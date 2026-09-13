@@ -110,7 +110,16 @@ services:
       - "no"
       - --save
       - ""
-    ports: ["6379:6379"]
+    # Host side is overridable because Windows can take 6379 away. WinNAT reserves
+    # blocks of 100 ports at boot (`netsh interface ipv4 show excludedportrange
+    # protocol=tcp`), picked afresh each time, and one block that included 6379
+    # made the whole stack fail to start with "access permissions" - the error
+    # names a permission, the cause is a reservation. Only the host tools
+    # (pool-warmup, invariant-checker) use this port; the apps talk to redis:6379
+    # inside the network and are unaffected.
+    #
+    #   TATKAL_REDIS_PORT=7379 docker compose up -d
+    ports: ["${TATKAL_REDIS_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
