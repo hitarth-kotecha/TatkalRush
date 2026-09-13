@@ -375,7 +375,7 @@ class PoolRebuilderTest {
         rebuilder.rebuildAll();
 
         var all = new ArrayList<>(SqlInvariants.all());
-        all.addAll(RedisInvariants.all(redis, 120_000L));
+        all.addAll(RedisInvariants.all(redis, 120_000L, java.time.InstantSource.system()));
         var report = new InvariantChecker(all).run(conn, InvariantChecker.Mode.QUIESCED);
 
         // INV-8 rebuilds expected masks from seat_allocations with its own query,

@@ -4,6 +4,8 @@ import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.time.Duration;
+import java.time.InstantSource;
 import java.util.ArrayList;
 
 /**
@@ -16,9 +18,14 @@ import java.util.ArrayList;
  * {@code provision()} and the {@code psp-sim} profile.
  *
  * <pre>
- *   java -jar ops/invariant-checker/target/invariant-checker.jar \
+ *   java -Dtatkal.hold.ttl-ms=15000 -Dtatkal.clock.offset=P40D \
+ *       -jar ops/invariant-checker/target/invariant-checker.jar \
  *       jdbc:postgresql://localhost:5432/tatkal tatkal tatkal [redisHost] [redisPort] [--continuous]
  * </pre>
+ *
+ * <p>Both properties must match the running system's {@code TATKALRUSH_HOLD_TTLMS}
+ * and {@code TATKALRUSH_CLOCK_OFFSET}. {@code loadtest/run-profile.sh} reads them
+ * from the container rather than trusting its own environment.
  *
  * <h2>Quiesced by default, and that is the important default</h2>
  *
@@ -72,6 +79,19 @@ public final class InvariantCheckerMain {
         // a leak.
         long holdTtlMillis = Long.getLong("tatkal.hold.ttl-ms", 120_000L);
 
+        // FR-31's offset, in the application's own ISO-8601 format. Hold expiries
+        // are stamped on the SYSTEM's clock, so INV-5 has to stand where the system
+        // stands. Without this, a P40D stack's holds all look forty days from
+        // expiring and INV-5 passes having checked nothing - which is why it now
+        // also detects the mismatch and says so.
+        Duration offset = Duration.parse(System.getProperty("tatkal.clock.offset", "PT0S"));
+        InstantSource systemClock =
+                offset.isZero()
+                        ? InstantSource.system()
+                        : InstantSource.offset(InstantSource.system(), offset);
+        System.out.printf(
+                "clock: host + %s  ->  system time %s%n", offset, systemClock.instant());
+
         RedisClient client = RedisClient.create(RedisURI.create(redisHost, redisPort));
         // Not client.connect(): the default UTF-8 codec silently destroys every
         // mask and free-count byte at or above 0x80. See RedisInvariants.connect.
@@ -79,7 +99,7 @@ public final class InvariantCheckerMain {
                 Connection conn = DriverManager.getConnection(args[0], args[1], args[2])) {
 
             var all = new ArrayList<Invariant>(SqlInvariants.all());
-            all.addAll(RedisInvariants.all(redis.sync(), holdTtlMillis));
+            all.addAll(RedisInvariants.all(redis.sync(), holdTtlMillis, systemClock));
 
             var report = new InvariantChecker(all).run(conn, mode);
             System.out.print(report.render());

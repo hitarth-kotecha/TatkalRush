@@ -17,6 +17,8 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
+import java.time.InstantSource;
 import java.util.List;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.AfterAll;
@@ -106,7 +108,7 @@ class RedisInvariantsTest {
     void reset() throws SQLException {
         redis.flushall();
         execute("TRUNCATE seat_allocations, passengers, bookings RESTART IDENTITY CASCADE");
-        checker = new InvariantChecker(RedisInvariants.all(redis, TTL_MILLIS));
+        checker = new InvariantChecker(RedisInvariants.all(redis, TTL_MILLIS, InstantSource.system()));
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -204,6 +206,68 @@ class RedisInvariantsTest {
 
             assertTrue(rendered.contains("hold-42"), rendered);
             assertTrue(rendered.contains("overdue_by_ms"), rendered);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    /**
+     * FR-31 moves the system's clock for the load profiles, and allocate.lua stamps
+     * hold expiries with it. These are the tests that would have caught INV-5
+     * passing after a P1 run that left 1,314 holds behind: every existing test used
+     * one clock for the hold and the checker, so the two could never disagree.
+     */
+    @Nested
+    @DisplayName("INV-5 under FR-31's clock offset")
+    class StaleHoldsUnderAnOffsetClock {
+
+        private final InstantSource system40DaysAhead =
+                InstantSource.offset(InstantSource.system(), Duration.ofDays(40));
+
+        private InvariantChecker checkerOn(InstantSource clock) {
+            return new InvariantChecker(RedisInvariants.all(redis, TTL_MILLIS, clock));
+        }
+
+        @Test
+        void aStaleHoldIsFoundWhenTheCheckerStandsWhereTheSystemStands() {
+            redis.zadd("holds:" + POOL, (double) (system40DaysAhead.millis() - 300_000), "hold-1");
+
+            var report = checkerOn(system40DaysAhead).run(db, InvariantChecker.Mode.QUIESCED);
+
+            assertFalse(report.passed(), report.render());
+            assertTrue(report.render().contains("overdue_by_ms"), report.render());
+        }
+
+        @Test
+        void aLiveHoldOnTheOffsetClockPasses() {
+            redis.zadd(
+                    "holds:" + POOL, (double) (system40DaysAhead.millis() + TTL_MILLIS), "hold-1");
+
+            assertTrue(
+                    checkerOn(system40DaysAhead).run(db, InvariantChecker.Mode.QUIESCED).passed());
+        }
+
+        /**
+         * The live failure. A hold that expired five minutes ago on the system's
+         * clock, read by a checker on the host's clock: it scores forty days ahead
+         * and would never be stale. Passing here is the bug - there is a leaked hold
+         * in Redis and the check had no way to see it.
+         */
+        @Test
+        void aCheckerOnTheWrongClockSaysSoInsteadOfPassing() {
+            redis.zadd("holds:" + POOL, (double) (system40DaysAhead.millis() - 300_000), "leaked");
+
+            var report = checkerOn(InstantSource.system()).run(db, InvariantChecker.Mode.QUIESCED);
+
+            assertFalse(report.passed(), "INV-5 passed on a clock it could not judge from");
+            assertTrue(report.render().contains("clock disagrees"), report.render());
+        }
+
+        /** The guard's boundary: exactly now + TTL is what allocate.lua writes. */
+        @Test
+        void aFreshHoldIsNotMistakenForAClockMismatch() {
+            redis.zadd("holds:" + POOL, (double) (System.currentTimeMillis() + TTL_MILLIS), "fresh");
+
+            assertTrue(checker.run(db, InvariantChecker.Mode.QUIESCED).passed());
         }
     }
 

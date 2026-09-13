@@ -9,6 +9,7 @@ import io.lettuce.core.api.sync.RedisCommands;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.InstantSource;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -38,6 +39,16 @@ import java.util.List;
  * skips these in continuous mode rather than reporting divergence that is expected.
  */
 public final class RedisInvariants {
+
+    /** §14's "TTL + 30 s": how long past expiry a hold may wait for a reaper. */
+    static final long STALE_HOLD_GRACE_MILLIS = 30_000;
+
+    /**
+     * The checker runs on the host and the system inside Docker's VM, and WSL2's
+     * clock is known to drift after the host sleeps. Past this, INV-5 says the
+     * clocks disagree rather than guessing.
+     */
+    static final long CLOCK_SKEW_TOLERANCE_MILLIS = 5_000;
 
     private RedisInvariants() {}
 
@@ -73,11 +84,16 @@ public final class RedisInvariants {
 
 
     /**
-     * @param holdTtlMillis FR-17's 120 s, so INV-5's threshold moves with it
+     * @param holdTtlMillis FR-17's TTL as the running system has it configured
+     * @param systemClock the running system's clock, <b>including FR-31's offset</b>.
+     *     Required rather than defaulted: hold expiries are stamped with the
+     *     system's clock, and a checker on any other clock asks INV-5 a question
+     *     with a fixed answer. See {@link #noStaleHolds}.
      */
-    public static List<Invariant> all(RedisCommands<String, String> redis, long holdTtlMillis) {
+    public static List<Invariant> all(
+            RedisCommands<String, String> redis, long holdTtlMillis, InstantSource systemClock) {
         return List.of(
-                noStaleHolds(redis, holdTtlMillis),
+                noStaleHolds(redis, holdTtlMillis, systemClock),
                 masksMatchPostgres(redis),
                 freeCountsMatchMasks(redis));
     }
@@ -96,8 +112,26 @@ public final class RedisInvariants {
      * <p>What it catches is the reaper being <em>broken</em> rather than behind:
      * berths held by nobody, invisible to Postgres because the booking is long
      * since expired, and unsellable until something rebuilds the pool.
+     *
+     * <h2>It must run on the system's clock, and it checks that it is</h2>
+     *
+     * <p>{@code allocate.lua} scores each hold {@code nowMs + ttlMs}, and
+     * {@code nowMs} comes from the application's {@code InstantSource} — which
+     * FR-31 offsets for the load profiles. The first version of this check read
+     * {@code System.currentTimeMillis()}. Under {@code TATKAL_CLOCK_OFFSET=P40D}
+     * every hold then scored forty days in the future, nothing was ever stale, and
+     * INV-5 passed after a P1 run that left 1,314 holds in Redis. It could not
+     * have failed. Tests never saw it, because tests do not offset the clock.
+     *
+     * <p>So the clock is a parameter, and the check also refuses to be vacuous.
+     * No hold can score further ahead than {@code now + TTL}: that is the largest
+     * value the script ever writes. A score beyond it — with a few seconds for
+     * clock skew between the host and the Docker VM — proves the checker and the
+     * system disagree about the time. That is reported as "could not be checked",
+     * the way INV-8 reports live holds, rather than as a pass.
      */
-    public static Invariant noStaleHolds(RedisCommands<String, String> redis, long holdTtlMillis) {
+    public static Invariant noStaleHolds(
+            RedisCommands<String, String> redis, long holdTtlMillis, InstantSource systemClock) {
         return new Invariant() {
             @Override
             public String id() {
@@ -116,26 +150,52 @@ public final class RedisInvariants {
 
             @Override
             public List<String> violations(CheckContext context) {
-                long cutoff = System.currentTimeMillis() - 30_000;
-                var violations = new ArrayList<String>();
+                long now = systemClock.millis();
+                long cutoff = now - STALE_HOLD_GRACE_MILLIS;
+                long latestPossibleExpiry = now + holdTtlMillis + CLOCK_SKEW_TOLERANCE_MILLIS;
+                List<String> holdsKeys = redis.keys("holds:*");
 
-                for (String holdsKey : redis.keys("holds:*")) {
+                // First: is this question answerable at all?
+                long impossible = 0;
+                double furthest = 0;
+                for (String holdsKey : holdsKeys) {
+                    var ahead =
+                            redis.zrangebyscoreWithScores(
+                                    holdsKey,
+                                    Range.from(
+                                            Range.Boundary.excluding((double) latestPossibleExpiry),
+                                            Range.Boundary.unbounded()));
+                    impossible += ahead.size();
+                    for (var hold : ahead) {
+                        furthest = Math.max(furthest, hold.getScore());
+                    }
+                }
+                if (impossible > 0) {
+                    return List.of(
+                            // Parenthesised so .formatted applies to the whole message.
+                            ("%d hold(s) expire further ahead than TTL allows, by up to %d ms."
+                                            + " The checker's clock disagrees with the system's"
+                                            + " (FR-31 offset not passed? -Dtatkal.clock.offset must"
+                                            + " match TATKALRUSH_CLOCK_OFFSET), so no hold can be"
+                                            + " judged stale and INV-5 could not be evaluated")
+                                    .formatted(impossible, (long) furthest - (now + holdTtlMillis)));
+                }
+
+                var violations = new ArrayList<String>();
+                for (String holdsKey : holdsKeys) {
                     // The ZSET's score is the hold's EXPIRY, not its creation - so
                     // anything scoring below (now - grace) expired more than the
                     // grace period ago and should have been swept.
-                    var stale = redis.zrangebyscore(holdsKey, Range.create(0d, (double) cutoff));
-                    for (String holdId : stale) {
-                        Double score = redis.zscore(holdsKey, holdId);
+                    var stale =
+                            redis.zrangebyscoreWithScores(holdsKey, Range.create(0d, (double) cutoff));
+                    for (var hold : stale) {
                         violations.add(
-                                "pool=%s, holdId=%s, expired_at=%s, overdue_by_ms=%d"
+                                "pool=%s, holdId=%s, expired_at=%d, overdue_by_ms=%d"
                                         .formatted(
                                                 holdsKey,
-                                                holdId,
-                                                score == null ? "?" : score.longValue(),
-                                                score == null
-                                                        ? -1
-                                                        : System.currentTimeMillis()
-                                                                - score.longValue()));
+                                                hold.getValue(),
+                                                (long) hold.getScore(),
+                                                now - (long) hold.getScore()));
                     }
                 }
                 return capped(violations);
