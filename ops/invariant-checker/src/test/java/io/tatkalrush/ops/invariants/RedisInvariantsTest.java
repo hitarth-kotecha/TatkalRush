@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.codec.ByteArrayCodec;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -75,7 +76,12 @@ class RedisInvariantsTest {
                 POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword());
 
         client = RedisClient.create(RedisURI.create(REDIS.getHost(), REDIS.getMappedPort(6379)));
-        connection = client.connect();
+        // NOT client.connect(). The default UTF-8 codec re-encodes every byte at
+        // or above 0x80 on the way in and decodes it back on the way out, so a test
+        // that writes and reads through it round-trips perfectly while storing
+        // different bytes from the ones Lua wrote. It agreed with itself and
+        // disagreed with the system: a pool with 172 free berths read as 63.
+        connection = RedisInvariants.connect(client);
         redis = connection.sync();
 
         seedReference();
@@ -393,9 +399,41 @@ class RedisInvariantsTest {
         givenPoolWithCounts(masks, counts);
     }
 
+    /**
+     * Writes the blobs as RAW BYTES, through a separate byte-array connection.
+     *
+     * <p>This used to write them as Strings through the same connection the checks
+     * read from, and that made the test unable to see the bug it most needed to
+     * see. Under a UTF-8 codec, {@code set(key, isoString)} encodes char 0xAC as two
+     * bytes and {@code get} decodes them back to 0xAC — the String round-trips
+     * perfectly while the bytes in Redis are not the ones Lua writes. The test
+     * agreed with itself and disagreed with the system.
+     *
+     * <p>Bytes are what {@code init-pool.lua} puts there, so bytes are what the
+     * fixture puts there. Now a checker reading through the wrong codec fails here
+     * rather than in a benchmark.
+     */
     private void givenPoolWithCounts(long[] masks, int[] counts) {
-        redis.set("masks:" + POOL, masksBlob(masks));
-        redis.set("freecount:" + POOL, freeBlob(counts));
+        var bytes = client.connect(ByteArrayCodec.INSTANCE).sync();
+        bytes.set(("masks:" + POOL).getBytes(StandardCharsets.US_ASCII), maskBytes(masks));
+        bytes.set(("freecount:" + POOL).getBytes(StandardCharsets.US_ASCII), freeBytes(counts));
+    }
+
+    private static byte[] maskBytes(long... masks) {
+        var buffer = ByteBuffer.allocate(masks.length * 8).order(ByteOrder.LITTLE_ENDIAN);
+        for (long mask : masks) {
+            buffer.putInt((int) (mask & 0xFFFFFFFFL));
+            buffer.putInt((int) (mask >>> 32));
+        }
+        return buffer.array();
+    }
+
+    private static byte[] freeBytes(int... counts) {
+        var buffer = ByteBuffer.allocate(counts.length * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int count : counts) {
+            buffer.putInt(count);
+        }
+        return buffer.array();
     }
 
     private void givenConfirmedAllocation(int bookingId, int berthId, String range)
@@ -411,6 +449,58 @@ class RedisInvariantsTest {
         execute(
                 "INSERT INTO seat_allocations (schedule_id, berth_id, booking_id, seg_range)"
                     + " VALUES (1, %d, %d, '%s'::int4range)".formatted(berthId, bookingId, range));
+    }
+
+    @Test
+    @DisplayName("a pool larger than 127 berths is read correctly")
+    void poolsWithHighBytesAreNotCorrupted() {
+        // EVERY OTHER TEST IN THIS CLASS USES TWO TO SIX BERTHS, and that is why the
+        // codec bug survived: a free count of 6 is one ASCII byte, valid UTF-8,
+        // round-tripped by any codec. Corruption begins at 128, and the seeded
+        // dataset has pools of up to 259.
+        //
+        // 172 free berths is the byte 0xAC. Under UTF-8 it is not a valid sequence,
+        // arrives as U+FFFD, and ISO-8859-1 then renders that as 0x3F - so the
+        // checker reported "stored=63, recomputed=172" for thousands of segments on
+        // a system that was entirely correct.
+        int berths = 172;
+        var masks = new long[berths];
+        var counts = new int[4];
+        java.util.Arrays.fill(counts, berths);
+
+        givenPoolWithCounts(masks, counts);
+
+        var report = new InvariantChecker(java.util.List.of(RedisInvariants.freeCountsMatchMasks(redis)))
+                .run(db, InvariantChecker.Mode.QUIESCED);
+
+        assertTrue(report.passed(), report.render());
+    }
+
+    @Test
+    @DisplayName("a high byte inside a mask survives the round trip too")
+    void maskBytesAboveAsciiAreNotCorrupted() {
+        // 0x80 through 0xFF appear in masks as readily as in counts: a berth
+        // occupied on segments 7..15 has bytes 0x80 and 0xFF. INV-8 would report
+        // those as mismatches against a Postgres side that was right.
+        var masks = new long[] {0xFFL << 7, 0x80L, 0xACACL};
+        var counts = new int[4];
+        for (int segment = 0; segment < counts.length; segment++) {
+            long bit = 1L << segment;
+            int free = 0;
+            for (long mask : masks) {
+                if ((mask & bit) == 0) {
+                    free++;
+                }
+            }
+            counts[segment] = free;
+        }
+
+        givenPoolWithCounts(masks, counts);
+
+        var report = new InvariantChecker(java.util.List.of(RedisInvariants.freeCountsMatchMasks(redis)))
+                .run(db, InvariantChecker.Mode.QUIESCED);
+
+        assertTrue(report.passed(), report.render());
     }
 
     /** The wire format, built here rather than borrowed from the encoder. */

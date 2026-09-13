@@ -1,6 +1,10 @@
 package io.tatkalrush.ops.invariants;
 
 import io.lettuce.core.Range;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.codec.StringCodec;
+import java.nio.charset.StandardCharsets;
 import io.lettuce.core.api.sync.RedisCommands;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -36,6 +40,37 @@ import java.util.List;
 public final class RedisInvariants {
 
     private RedisInvariants() {}
+
+    /**
+     * The only sanctioned way to open a connection for these checks.
+     *
+     * <h2>Lettuce's default codec destroys the data these invariants read</h2>
+     *
+     * <p>{@code RedisClient.connect()} uses {@code StringCodec.UTF8}. INV-8 and
+     * INV-12 read {@code masks:} and {@code freecount:} as <b>packed binary</b>,
+     * and any byte at or above {@code 0x80} is not valid UTF-8 — so it arrives as
+     * U+FFFD, and {@link PoolSnapshot}'s ISO-8859-1 round-trip then turns that into
+     * {@code 0x3F}. A pool with 172 free berths reported <b>63</b>: the byte
+     * {@code 0xAC} became a replacement character became {@code '?'}.
+     *
+     * <p>Every existing test passed because they use pools of two to six berths and
+     * short masks — every byte below {@code 0x80}, every byte valid UTF-8. The
+     * corruption begins at 128 free berths, and the seeded dataset's pools have up
+     * to 259.
+     *
+     * <p>ISO-8859-1 maps bytes 0–255 to code points 0–255 one for one, so a String
+     * round-trips arbitrary bytes exactly. Key names are ASCII and unaffected.
+     *
+     * <p>Confined to this module on purpose: no production path reads a blob as a
+     * String — {@code dump-state.lua} unpacks to integers inside Redis, and the
+     * berth-id mapping is decimal text. The checker is exposed precisely because it
+     * decodes the bytes itself rather than asking the allocator, which is what makes
+     * INV-8 evidence rather than a restatement.
+     */
+    public static StatefulRedisConnection<String, String> connect(RedisClient client) {
+        return client.connect(new StringCodec(StandardCharsets.ISO_8859_1));
+    }
+
 
     /**
      * @param holdTtlMillis FR-17's 120 s, so INV-5's threshold moves with it
@@ -164,8 +199,15 @@ public final class RedisInvariants {
                         // made. Reporting "matched" here would be a green light
                         // nobody earned.
                         violations.add(
-                                "pool=%s has %d live hold(s); masks legitimately differ from"
-                                    + " seat_allocations until they drain (§14: quiesce first)"
+                                // Parenthesised: .formatted binds to the last literal
+                                // of a concatenation, so without these the %s and %d
+                                // survive into the message verbatim. It shipped that
+                                // way and only a live run showed it, because the test
+                                // asserts that a violation is REPORTED, not what it
+                                // says.
+                                ("pool=%s has %d live hold(s); masks legitimately differ from"
+                                                + " seat_allocations until they drain"
+                                                + " (§14: quiesce first)")
                                         .formatted(pool, liveHolds));
                         continue;
                     }
