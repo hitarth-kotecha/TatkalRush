@@ -2839,6 +2839,133 @@ re-resolution is not doing what this entry claims.
 
 ---
 
+### DD-046 — §13.2's hold reaper: one lease per sweep, discovery by SCAN, a copied loop held by T-7
+
+Date: 2026-09-13 · Author: Phase 1c · Phase: 1 · Requirements: FR-18, §9.2, §12, §13.2, INV-5, INV-8, INV-10
+Supersedes: —
+
+**Context.**
+
+§13.2 specifies a background reaper — every 5 s per replica, behind a Redis lock —
+and §12 gives it two effects: release the berths and move the booking to
+`EXPIRED`. **Neither existed.** Reaping happened only lazily inside `allocate.lua`,
+which is correct and sufficient for any pool someone is booking from, and nothing
+ever moved a lapsed `HELD` booking anywhere. V4's partial index,
+`idx_bookings_live_holds`, carries a comment saying it "drives the hold reaper";
+nothing had ever read it.
+
+It surfaced as the first P1 run that routed correctly. Afterwards 1,314 holds sat
+in 89 pools that the spike had moved on from, every one of those bookings still
+said `HELD`, and INV-8 — which needs holds drained before it can compare masks with
+Postgres — could not be evaluated at all. The harness had papered over it with a
+"nudge": a burst of holds meant to trigger lazy reaping. It could not work. It only
+reached pools it booked from, and its own holds were still live when INV-8 ran, so
+it manufactured the reports it was meant to clear.
+
+**Decision.**
+
+- **Port.** `SeatAllocator.reapExpired(Instant now)` sweeps every pool the strategy
+  owns. Discovery is the strategy's business: Strategy A scans Redis, Strategy B's
+  partition owner will reap what it owns. Six contract tests, run against both the
+  in-memory reference and Redis.
+- **Strategy A.** `reap.lua` per pool, found by `SCAN MATCH holds:*`. Redis deletes a
+  ZSET with its last member, so the scan returns pools that hold something — dozens
+  after a spike, not 3,600. One failing pool does not stop the sweep; the first
+  failure is rethrown after every pool has been attempted.
+- **Postgres.** A separate port, `HoldExpiry.expireLapsed(now, limit)`: one
+  `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`, batched 500 at a time
+  and capped at 20 batches per sweep. It clears `hold_expires_at` (INV-10) and never
+  touches `PAYMENT_PENDING`.
+- **Use case.** `ExpireHolds` runs both halves. Order does not matter: each side is
+  decided by its own record and the clock, so a crash between them recovers on the
+  next sweep.
+- **Scheduler.** `HoldReaper` in `app/`: `scheduleWithFixedDelay` every 5 s, one
+  `SET reaper:lease NX PX 4000` per sweep, every exception caught and counted, and
+  `hold_reaper_last_sweep_epoch_seconds` so a stuck reaper is visible.
+
+**Alternatives considered.**
+
+1. **Rejected — a lock per pool, as §13.2 literally says.** Up to 3,600 extra round
+   trips every five seconds to protect an operation that is already atomic per pool
+   and idempotent. The lease here stops two replicas doing the *same sweep*; nothing
+   depends on it beyond that, and its TTL is shorter than the interval so a replica
+   that dies holding it costs one sweep. This is a deliberate deviation in
+   granularity and is recorded as one.
+
+2. **Rejected — discover pools from Postgres `HELD` rows.** One query, and it misses
+   exactly the case a reaper is for after a crash: a hold that reached Redis while
+   its booking insert never committed. Redis is where the berths are held, so Redis
+   is where the reaper looks.
+
+3. **Rejected — an index ZSET of pools-with-holds, written by `allocate.lua`.**
+   Cheaper to read than a `SCAN`. It puts a cross-pool write on the hottest path in
+   the system, the one T-7 guards, for a job that runs every five seconds.
+
+4. **Rejected — reuse `allocate.lua` with a request that cannot fit.** Zero
+   duplicated Lua: the script reaps, fails to allocate, persists the reap. It works
+   only while allocate's early exits stay exactly as they are, and the first person
+   to optimise that path would silently turn the reaper into a no-op.
+
+5. **Rejected — `expireLapsed` on `BookingRepository`.** The natural home. Four
+   hand-written test fakes implement that interface for use cases that never expire
+   anything, and each would have grown a stub.
+
+**Consequences.**
+
+`reap.lua` duplicates `allocate.lua`'s reap loop. That is held in check rather than
+hoped about: T-7 gained a `Reap` operation comparing `reap.lua` with
+`BerthPool.reapExpired` after every step, and a targeted property for the state the
+random generator almost never reaches — one berth carrying an expired hold and a
+live complementary one, with the reap arriving between the two expiries.
+
+That property earned its place immediately. A mutation that cleared the whole berth
+instead of AND-NOT-ing one hold's bits **passed every contract test and 400 random
+T-7 scenarios**: free counts stayed right, so availability looked right, while a
+live hold's segments had been freed — the berth was sellable twice. The contract
+test now asks that directly (a second customer tries to take the still-held
+segments) and the targeted property catches the high-word variant the contract's
+four-segment pools cannot reach.
+
+Mutations killed: whole-berth clear (low word, high word), exclusive expiry, free
+counts not persisted, `SKIP LOCKED` removed (fails in 3 s by name rather than
+hanging), exclusive expiry in SQL, `PAYMENT_PENDING` touched, `hold_expires_at`
+kept, newest-first batching, and the scheduler rethrowing — which stopped the
+reaper after `calls=1`, the silent-stall failure it exists to prevent.
+
+`RedisSeatAllocatorTest` now empties Redis before each test. It shared one instance
+across the class and nothing noticed, because nothing reached every pool at once
+until `reapExpired`.
+
+**The first deployment failed a replica's boot.** The scheduler was started inside
+its `@Bean` method, so its first sweep ran while the context was still being built.
+Spring Boot orders its own JDBC beans after Flyway; a custom bean that merely takes
+a `DataSource` gets no such ordering. On a cold stack the sweep took the pool's only
+connection before Flyway had validated the schema, Flyway timed out waiting for it,
+and app-2 restarted — "hold reaper running" at 11:38:01.764, context failed at
+11:38:23. `HoldReaper` is now a `SmartLifecycle`: started after refresh, stopped
+before the DataSource is destroyed. `ProfileContextTest` asserts, through a
+`BeanPostProcessor`, that the reaper is **not running when its bean is created** and
+**is running once the context is up** — deterministic, where the race was not.
+Putting `start()` back in the factory method fails that test by name.
+
+The load harness no longer sleeps and nudges. It waits for `holds:*` to be empty and
+for no `HELD` booking to remain, with a timeout of TTL + 60 s, and reports how long
+draining took. A run that does not drain is invalid.
+
+`tatkalrush.reaper.enabled=false` exists to test §9.2's claim rather than assert it:
+with the reaper off, no seat should be lost and no invariant should fail except the
+quiesced ones that need idle pools drained.
+
+**What would change this.**
+
+If the `SCAN` becomes a measurable cost — a P4 soak leaving tens of thousands of
+pools with live holds at once — an index becomes worth its hot-path write. The
+falsifiable form: **if a P1 or P2 run reports `NOT DRAINED` while
+`hold_reaper_sweeps_total{outcome="failed"}` is zero**, sweeps are completing and
+still not keeping up, and discovery or batching is the bottleneck.
+
+---
+
 ## Appendix — decisions still open
 
 | ID | Question | Raised | Status |

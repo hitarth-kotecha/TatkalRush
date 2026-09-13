@@ -71,8 +71,32 @@ class ProfileContextTest {
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
 
+    /**
+     * Records whether the reaper was already running when its bean finished
+     * initialising - the moment a factory-method start() would have begun sweeping,
+     * before Flyway. The race it caused is timing-dependent; this is not.
+     */
+    static class ReaperCreationObserver {
+        static final java.util.concurrent.atomic.AtomicReference<Boolean> runningWhenCreated =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        @org.springframework.context.annotation.Bean
+        static org.springframework.beans.factory.config.BeanPostProcessor reaperObserver() {
+            return new org.springframework.beans.factory.config.BeanPostProcessor() {
+                @Override
+                public Object postProcessAfterInitialization(Object bean, String name) {
+                    if (bean instanceof HoldReaper reaper) {
+                        runningWhenCreated.set(reaper.isRunning());
+                    }
+                    return bean;
+                }
+            };
+        }
+    }
+
     @Nested
     @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+    @org.springframework.context.annotation.Import(ReaperCreationObserver.class)
     @DisplayName("app-1 and app-2: the booking role")
     class BookingRole {
 
@@ -89,6 +113,31 @@ class ProfileContextTest {
             assertEquals(1, context.getBeanNamesForType(RateLimitFilter.class).length);
             assertEquals(1, context.getBeanNamesForType(RateLimiter.class).length);
             assertEquals(1, context.getBeanNamesForType(SeatAllocator.class).length);
+        }
+
+        @Test
+        void theHoldReaperRunsInTheBookingRole() {
+            // §13.2: every booking replica runs one. Its absence produced the first
+            // P1 run's 1,314 holds that nothing ever released.
+            assertEquals(1, context.getBeanNamesForType(HoldReaper.class).length);
+        }
+
+        /**
+         * Started by the lifecycle, after refresh - never by its own factory method.
+         *
+         * <p>Started during bean creation, its first sweep asked for a connection
+         * before Flyway had run, and on a cold stack Flyway timed out waiting for
+         * it: app-2 failed to boot.
+         */
+        @Test
+        void theReaperStartsAfterTheContextNotDuringIt() {
+            assertEquals(
+                    Boolean.FALSE,
+                    ReaperCreationObserver.runningWhenCreated.get(),
+                    "the reaper was sweeping before the context (and Flyway) had finished");
+            assertTrue(
+                    context.getBean(HoldReaper.class).isRunning(),
+                    "and once the context is up, it must actually be running");
         }
     }
 
@@ -117,6 +166,10 @@ class ProfileContextTest {
             assertEquals(0, context.getBeanNamesForType(RateLimitFilter.class).length);
             assertEquals(0, context.getBeanNamesForType(SearchController.class).length);
             assertEquals(0, context.getBeanNamesForType(SeatAllocator.class).length);
+            assertEquals(
+                    0,
+                    context.getBeanNamesForType(HoldReaper.class).length,
+                    "the simulator has no holds to reap and no pool to reap them into");
         }
 
         @Test

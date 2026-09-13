@@ -101,6 +101,21 @@ class AllocatorEquivalenceProperties {
                 return "FREE hold#" + holdIndex;
             }
         }
+
+        /**
+         * §13.2's background reap: BerthPool.reapExpired against reap.lua.
+         *
+         * <p>reap.lua copies allocate.lua's reap loop, because Lua under EVALSHA has
+         * no shared modules. A copy can drift, so it is held to the same reference
+         * the original is: both Lua loops are compared with one Java method, and
+         * neither can diverge from it without failing here.
+         */
+        record Reap(long atMillis) implements Op {
+            @Override
+            public String toString() {
+                return "REAP @%dms".formatted(atMillis);
+            }
+        }
     }
 
     private record Scenario(int berths, int segments, List<Op> ops) {
@@ -136,8 +151,20 @@ class AllocatorEquivalenceProperties {
             // either implementation.
             clock += r.nextInt(4) == 0 ? TTL + 1 : r.nextInt(20_000);
 
-            if (r.nextInt(5) == 0) {
+            int kind = r.nextInt(10);
+            if (kind < 2) {
                 ops.add(new Op.Release(r.nextInt(6)));
+            } else if (kind < 4) {
+                // Sometimes exactly one TTL on from the previous operation, which
+                // lands precisely on the expiry of any hold it created: expiry is
+                // inclusive in both implementations, and "inclusive" is the kind of
+                // claim that is true in one place and off by one in another. The
+                // clock ADVANCES rather than the reap peeking ahead, so time never
+                // runs backwards for the operations after it.
+                if (r.nextBoolean()) {
+                    clock += TTL;
+                }
+                ops.add(new Op.Reap(clock));
             } else {
                 int from = r.nextInt(segments);
                 int to = from + 1 + r.nextInt(segments - from);
@@ -194,6 +221,41 @@ class AllocatorEquivalenceProperties {
                         ops.add(new Op.Allocate(SegmentRange.of(from, to), 1 + r.nextInt(2), clock));
                     }
                     return new Scenario(berths, 64, List.copyOf(ops));
+                },
+                AllocatorEquivalenceProperties::runBothAndCompare,
+                AllocatorEquivalenceProperties::shrink);
+    }
+
+    @Test
+    @DisplayName("T-7 / §13.2: a reap that separates two holds on one berth agrees")
+    void aReapBetweenTwoExpiriesAgrees() {
+        // The state the random generator almost never reaches, and the one where a
+        // wrong reap does the most damage: one berth carrying an expired hold and a
+        // live complementary one (T-3), with the background reap - not an allocate -
+        // arriving between the two expiries. A reap that cleared the whole berth
+        // instead of AND-NOT-ing one hold's bits passed the random property 400
+        // times, because nothing else in the sequence ever put it in this position.
+        //
+        // Ranges are drawn on both sides of the 32-bit split, since the two halves
+        // are cleared by separate lines of Lua and each can be wrong on its own.
+        PropertyRunner.check(
+                "reap.lua and BerthPool.reapExpired agree when only some holds on a berth expire",
+                SEED + 13,
+                200,
+                r -> {
+                    int berths = 1 + r.nextInt(2);
+                    int segments = r.nextBoolean() ? 2 + r.nextInt(8) : 34 + r.nextInt(31);
+                    int split = 1 + r.nextInt(segments - 1);
+                    long gap = 1 + r.nextInt((int) TTL - 1);
+
+                    var ops = new ArrayList<Op>();
+                    ops.add(new Op.Allocate(SegmentRange.of(0, split), 1, 0));
+                    ops.add(new Op.Allocate(SegmentRange.of(split, segments), 1, gap));
+                    // After the first expiry, strictly before the second.
+                    ops.add(new Op.Reap(TTL + r.nextInt((int) gap)));
+                    // And then the rest, so the survivor's own reap is compared too.
+                    ops.add(new Op.Reap(gap + TTL));
+                    return new Scenario(berths, segments, List.copyOf(ops));
                 },
                 AllocatorEquivalenceProperties::runBothAndCompare,
                 AllocatorEquivalenceProperties::shrink);
@@ -282,6 +344,15 @@ class AllocatorEquivalenceProperties {
                         java.release(holdId);
                         redisAllocator.release(holdId);
                     }
+                }
+                case Op.Reap reap -> {
+                    Instant at = T0.plusMillis(reap.atMillis());
+                    int javaReaped = java.reapExpired(at);
+                    int luaReaped = redisAllocator.reapExpired(pool, at);
+                    assertEquals(
+                            javaReaped,
+                            luaReaped,
+                            () -> describe(scenario, stepNumber, op, "reaped different hold counts"));
                 }
             }
 

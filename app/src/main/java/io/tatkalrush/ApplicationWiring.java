@@ -12,6 +12,7 @@ import io.tatkalrush.admission.RedisRateLimiter;
 import io.tatkalrush.adapters.paymentsim.HttpPaymentGateway;
 import io.tatkalrush.adapters.paymentsim.WebhookSigner;
 import io.tatkalrush.adapters.persistence.JdbcBookingRepository;
+import io.tatkalrush.adapters.persistence.JdbcHoldExpiry;
 import io.tatkalrush.adapters.persistence.JdbcIdempotencyStore;
 import io.tatkalrush.adapters.persistence.JdbcPaymentRepository;
 import io.tatkalrush.adapters.persistence.JdbcPnrSequence;
@@ -21,6 +22,7 @@ import io.tatkalrush.adapters.persistence.SpringUnitOfWork;
 import io.tatkalrush.adapters.web.PaymentWebhookController;
 import io.tatkalrush.application.ports.AvailabilityCache;
 import io.tatkalrush.application.ports.BookingRepository;
+import io.tatkalrush.application.ports.HoldExpiry;
 import io.tatkalrush.application.ports.IdempotencyStore;
 import io.tatkalrush.application.ports.IntegrityAlarm;
 import io.tatkalrush.application.ports.PaymentGateway;
@@ -34,6 +36,7 @@ import io.tatkalrush.application.ports.TrainSearchQuery;
 import io.tatkalrush.application.ports.UnitOfWork;
 import io.tatkalrush.application.usecases.CancelBooking;
 import io.tatkalrush.application.usecases.ConfirmBooking;
+import io.tatkalrush.application.usecases.ExpireHolds;
 import io.tatkalrush.application.usecases.HoldSeats;
 import io.tatkalrush.application.usecases.InitiatePayment;
 import io.tatkalrush.application.usecases.SearchTrains;
@@ -297,6 +300,58 @@ public class ApplicationWiring {
     SearchTrains searchTrains(
             TrainSearchQuery routes, SeatAllocator allocator, AvailabilityCache cache) {
         return new SearchTrains(routes, allocator, cache);
+    }
+
+    @Bean
+    HoldExpiry holdExpiry(DataSource dataSource) {
+        return new JdbcHoldExpiry(dataSource);
+    }
+
+    @Bean
+    ExpireHolds expireHolds(SeatAllocator allocator, HoldExpiry holdExpiry) {
+        return new ExpireHolds(allocator, holdExpiry);
+    }
+
+    /**
+     * §13.2. Every replica runs one; the lease decides whose turn each sweep is.
+     *
+     * <p>{@code tatkalrush.reaper.enabled=false} exists for exactly one purpose:
+     * proving §9.2's claim that correctness does not depend on this. A chaos run
+     * with the reaper off should lose no seats and fail no invariant except the
+     * quiesced ones that need idle pools drained.
+     */
+    @Bean
+    HoldReaper holdReaper(
+            ExpireHolds expireHolds,
+            InstantSource clock,
+            RedisCommands<String, String> redis,
+            MeterRegistry meters,
+            @Value("${tatkalrush.reaper.interval-ms:5000}") long intervalMillis,
+            @Value("${tatkalrush.reaper.enabled:true}") boolean enabled) {
+        Duration interval = Duration.ofMillis(intervalMillis);
+        String owner = System.getenv().getOrDefault("HOSTNAME", "unknown");
+        // Lease shorter than the interval: a replica that dies holding it costs one
+        // sweep, never a stuck reaper.
+        Duration leaseTtl = interval.multipliedBy(4).dividedBy(5);
+
+        // NOT started here. It is a SmartLifecycle, so Spring starts it once the
+        // context has refreshed - after Flyway. Starting it in this method raced
+        // Flyway for the connection pool and failed app-2's boot (see HoldReaper).
+        var reaper =
+                new HoldReaper(
+                        expireHolds::sweep,
+                        clock,
+                        HoldReaper.redisLease(redis, owner, leaseTtl),
+                        meters,
+                        interval,
+                        enabled);
+        if (!enabled) {
+            log.warn(
+                    "HOLD REAPER DISABLED (tatkalrush.reaper.enabled=false). Allocation still"
+                        + " reaps lazily (§9.2), so no seat is lost - but idle pools keep expired"
+                        + " holds, HELD bookings never expire, and quiesced §14 checks cannot pass.");
+        }
+        return reaper;
     }
 
     @Bean

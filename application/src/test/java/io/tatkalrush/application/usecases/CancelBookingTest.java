@@ -368,6 +368,11 @@ class CancelBookingTest {
         public AvailabilitySnapshot availability(PoolKey pool, SegmentRange range) {
             throw new UnsupportedOperationException("not part of cancellation");
         }
+
+        @Override
+        public int reapExpired(java.time.Instant now) {
+            throw new UnsupportedOperationException("not part of cancellation");
+        }
     }
 
     private static final class FakeSchedules implements ScheduleQuery {

@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.tatkalrush.application.ports.BookingRepository;
@@ -321,6 +322,119 @@ class JdbcBookingRepositoryTest {
 
             assertNotEquals(a, b);
             assertEquals(a + 1, b);
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    @Nested
+    @DisplayName("FR-18 / §13.2: lapsed holds expire in Postgres")
+    class HoldExpiring {
+
+        private final JdbcHoldExpiry expiry = new JdbcHoldExpiry(dataSource);
+
+        @Test
+        void aLapsedHoldExpiresAndALiveOneDoesNot() {
+            long lapsed = heldUntil(List.of(1L), NOW.minusSeconds(1));
+            long live = heldUntil(List.of(2L), NOW.plusSeconds(1));
+
+            assertEquals(1, expiry.expireLapsed(NOW, 100));
+
+            assertEquals(BookingStatus.EXPIRED, bookings.findById(lapsed).orElseThrow().status());
+            assertEquals(BookingStatus.HELD, bookings.findById(live).orElseThrow().status());
+        }
+
+        @Test
+        void expiryIsInclusive() {
+            long id = heldUntil(List.of(1L), NOW);
+
+            assertEquals(1, expiry.expireLapsed(NOW, 100));
+            assertEquals(BookingStatus.EXPIRED, bookings.findById(id).orElseThrow().status());
+        }
+
+        /** INV-10: a terminal booking must not look like it still holds a berth. */
+        @Test
+        void theHoldExpiryIsCleared() throws SQLException {
+            long id = heldUntil(List.of(1L), NOW.minusSeconds(1));
+
+            expiry.expireLapsed(NOW, 100);
+
+            try (var st = admin.prepareStatement("SELECT hold_expires_at FROM bookings WHERE id = ?")) {
+                st.setLong(1, id);
+                try (var rs = st.executeQuery()) {
+                    rs.next();
+                    assertNull(rs.getTimestamp(1), "INV-10 would report this booking forever");
+                }
+            }
+        }
+
+        /** Money may be moving. FR-23 and FR-24 decide this booking, not the reaper. */
+        @Test
+        void aPaymentInProgressIsNeverExpired() {
+            long id = heldUntil(List.of(1L), NOW.minusSeconds(60));
+            unitOfWork.inTransaction(() -> bookings.beginPayment(id, NOW.minusSeconds(90)));
+
+            assertEquals(0, expiry.expireLapsed(NOW, 100));
+            assertEquals(
+                    BookingStatus.PAYMENT_PENDING, bookings.findById(id).orElseThrow().status());
+        }
+
+        @Test
+        void theLimitIsRespectedOldestFirstAndTheRestFollow() {
+            long oldest = heldUntil(List.of(1L), NOW.minusSeconds(30));
+            long middle = heldUntil(List.of(2L), NOW.minusSeconds(20));
+            long newest = heldUntil(List.of(3L), NOW.minusSeconds(10));
+
+            assertEquals(2, expiry.expireLapsed(NOW, 2));
+            assertEquals(BookingStatus.HELD, bookings.findById(newest).orElseThrow().status());
+            assertEquals(BookingStatus.EXPIRED, bookings.findById(oldest).orElseThrow().status());
+            assertEquals(BookingStatus.EXPIRED, bookings.findById(middle).orElseThrow().status());
+
+            assertEquals(1, expiry.expireLapsed(NOW, 2), "fewer than the limit: none remain");
+            assertEquals(0, expiry.expireLapsed(NOW, 2), "and idempotent after that");
+        }
+
+        /**
+         * The race that matters: payment initiation holding the row lock while the
+         * reaper runs. SKIP LOCKED means the reaper neither waits for it nor
+         * overwrites it - the booking goes wherever the other transaction takes it.
+         */
+        @Test
+        void aRowLockedByAnotherTransactionIsSkippedNotWaitedFor() throws Exception {
+            long id = heldUntil(List.of(1L), NOW.minusSeconds(1));
+
+            try (Connection other =
+                    DriverManager.getConnection(
+                            POSTGRES.getJdbcUrl(), POSTGRES.getUsername(), POSTGRES.getPassword())) {
+                other.setAutoCommit(false);
+                try (var lock = other.prepareStatement("SELECT id FROM bookings WHERE id = ? FOR UPDATE")) {
+                    lock.setLong(1, id);
+                    lock.executeQuery().close();
+                }
+
+                // On another thread with a deadline, because the failure mode is a
+                // hang: without SKIP LOCKED the UPDATE waits for `other`, which only
+                // rolls back after this returns. A test that blocks forever on the
+                // bug it exists to catch reports nothing.
+                var executor = java.util.concurrent.Executors.newSingleThreadExecutor();
+                try {
+                    var future = executor.submit(() -> expiry.expireLapsed(NOW, 100));
+                    int expired;
+                    try {
+                        expired = future.get(3, TimeUnit.SECONDS);
+                    } catch (java.util.concurrent.TimeoutException e) {
+                        other.rollback(); // unblock it, then fail with the reason
+                        future.get(10, TimeUnit.SECONDS);
+                        throw new AssertionError(
+                                "the reaper BLOCKED on a row another transaction held; it must skip it");
+                    }
+                    assertEquals(0, expired, "a locked row is someone else's decision this cycle");
+                } finally {
+                    executor.shutdownNow();
+                }
+                other.rollback();
+            }
+
+            assertEquals(1, expiry.expireLapsed(NOW, 100), "and the next sweep picks it up");
         }
     }
 

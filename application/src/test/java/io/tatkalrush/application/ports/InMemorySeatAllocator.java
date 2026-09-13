@@ -152,6 +152,17 @@ public final class InMemorySeatAllocator implements SeatAllocator {
         }
     }
 
+    @Override
+    public int reapExpired(Instant now) {
+        int reaped = 0;
+        for (PoolState s : pools.values()) {
+            synchronized (s.lock()) {
+                reaped += s.pool().reapExpired(now);
+            }
+        }
+        return reaped;
+    }
+
     private PoolState state(PoolKey key) {
         PoolState s = pools.get(key);
         if (s == null) {

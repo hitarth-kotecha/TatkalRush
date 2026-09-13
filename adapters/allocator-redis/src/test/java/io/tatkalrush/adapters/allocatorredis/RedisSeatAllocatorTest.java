@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.utility.DockerImageName;
 
@@ -62,6 +63,21 @@ class RedisSeatAllocatorTest extends SeatAllocatorContract {
             client.shutdown();
         }
         REDIS.stop();
+    }
+
+    /**
+     * One Redis for the whole class, emptied before each test.
+     *
+     * <p>Not needed until the contract had a method that reaches every pool.
+     * Schedule ids restart at 1 per test instance, so pools were re-provisioned
+     * over each other and nothing noticed - but {@code reapExpired} sweeps all
+     * {@code holds:*} keys, and a second pool left behind by an earlier test adds
+     * its expired holds to this test's count, in whatever order JUnit happened to
+     * pick. FLUSHALL leaves the script cache alone, so digests stay valid.
+     */
+    @BeforeEach
+    void emptyRedis() {
+        connection.sync().flushall();
     }
 
     @Override

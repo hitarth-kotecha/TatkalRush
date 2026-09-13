@@ -263,6 +263,115 @@ public abstract class SeatAllocatorContract {
         allocated(allocator().allocate(request(pool, 0, 4, 1, "third", afterTtl)));
     }
 
+    // ---------------------------------------------------- §13.2: the background reaper
+
+    @Test
+    @DisplayName("§13.2: the reaper frees an expired hold on a pool nobody is booking from")
+    void reaperFreesAnIdlePool() {
+        // The case lazy reaping cannot reach. No allocate follows the hold, so
+        // without this the berth stays set until someone happens to book here.
+        var pool = givenPool(2, 4);
+        var range = SegmentRange.of(0, 4);
+        allocated(allocator().allocate(request(pool, 0, 4, 2, "spike")));
+        assertEquals(0, allocator().availability(pool, range).freeBerths());
+
+        int reaped = allocator().reapExpired(T0.plusMillis(TTL + 1));
+
+        assertEquals(1, reaped);
+        assertEquals(
+                2,
+                allocator().availability(pool, range).freeBerths(),
+                "free counts restored, not just the hold record removed");
+    }
+
+    @Test
+    @DisplayName("§13.2: expiry is inclusive - a hold expiring exactly now is reaped")
+    void reaperExpiryIsInclusive() {
+        // The same boundary allocate's lazy reap, InitiatePayment's expiry check
+        // and FR-20's active-hold count all use. A reaper one millisecond stricter
+        // would disagree with them about which holds exist.
+        var pool = givenPool(1, 4);
+        allocated(allocator().allocate(request(pool, 0, 4, 1, "h")));
+
+        assertEquals(1, allocator().reapExpired(T0.plusMillis(TTL)));
+    }
+
+    @Test
+    @DisplayName("§13.2: the reaper leaves a live hold alone")
+    void reaperLeavesLiveHolds() {
+        var pool = givenPool(1, 4);
+        allocated(allocator().allocate(request(pool, 0, 4, 1, "h")));
+
+        assertEquals(0, allocator().reapExpired(T0.plusMillis(TTL - 1)));
+        assertEquals(0, allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths());
+        assertInstanceOf(
+                ConfirmResult.Confirmed.class,
+                allocator().confirm("h", 7L),
+                "a hold the reaper skipped is still confirmable");
+    }
+
+    @Test
+    @DisplayName("§13.2: the reaper never reaches a berth someone has paid for")
+    void reaperNeverReachesAConfirmedBooking() {
+        var pool = givenPool(1, 4);
+        allocated(allocator().allocate(request(pool, 0, 4, 1, "paid")));
+        allocator().confirm("paid", 1L);
+
+        assertEquals(0, allocator().reapExpired(T0.plusMillis(TTL * 10)));
+        assertEquals(
+                0,
+                allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths(),
+                "a reaper that frees a confirmed berth sells it twice");
+    }
+
+    @Test
+    @DisplayName("§13.2: reaping is idempotent, and a reaped hold confirms as expired")
+    void reaperIsIdempotentAndAgreesWithConfirm() {
+        var pool = givenPool(2, 4);
+        allocated(allocator().allocate(request(pool, 0, 2, 1, "a")));
+        allocated(allocator().allocate(request(pool, 2, 4, 1, "b")));
+        var later = T0.plusMillis(TTL + 1);
+
+        assertEquals(2, allocator().reapExpired(later));
+        assertEquals(0, allocator().reapExpired(later), "the second sweep finds nothing");
+        assertEquals(2, allocator().availability(pool, SegmentRange.of(0, 4)).freeBerths());
+
+        // FR-24's benign race, reached through the reaper rather than the lazy path.
+        assertInstanceOf(ConfirmResult.HoldExpired.class, allocator().confirm("a", 1L));
+    }
+
+    @Test
+    @DisplayName("§13.2: one sweep covers every pool, and clears only expired bits")
+    void reaperSweepsEveryPool() {
+        var first = givenPool(1, 4);
+        var second = givenPool(1, 4);
+        // T-3's shape on one berth: an expiring hold beside a later, live one.
+        // "new" is taken 1 ms BEFORE "old" expires. At exactly T0 + TTL its own
+        // allocate would lazily reap "old" first - correct behaviour, and it would
+        // leave this test measuring the lazy path instead of the sweep.
+        allocated(allocator().allocate(request(first, 0, 2, 1, "old")));
+        allocated(allocator().allocate(request(first, 2, 4, 1, "new", T0.plusMillis(TTL - 1))));
+        allocated(allocator().allocate(request(second, 0, 4, 1, "other")));
+
+        assertEquals(2, allocator().reapExpired(T0.plusMillis(TTL + 1)));
+
+        assertEquals(1, allocator().availability(first, SegmentRange.of(0, 2)).freeBerths());
+        assertEquals(
+                0,
+                allocator().availability(first, SegmentRange.of(2, 4)).freeBerths(),
+                "AND NOT, not a clear: the live hold's bits on the same berth survive");
+        assertEquals(1, allocator().availability(second, SegmentRange.of(0, 4)).freeBerths());
+
+        // The consequence, asked directly. Free counts are bookkeeping about the
+        // masks, and a reap that wiped the whole berth leaves them looking right -
+        // a mutation that did exactly that passed every assertion above. What it
+        // cannot survive is someone else trying to buy the berth "new" still holds.
+        assertInstanceOf(
+                AllocationResult.Unavailable.class,
+                allocator().allocate(request(first, 2, 4, 1, "intruder", T0.plusMillis(TTL + 1))),
+                "the reaper freed a live hold's segments: that berth is now sold twice");
+    }
+
     @Test
     @DisplayName("confirm promotes a live hold")
     void confirmLiveHold() {

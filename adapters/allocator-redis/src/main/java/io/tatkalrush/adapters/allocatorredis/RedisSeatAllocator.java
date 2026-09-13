@@ -272,6 +272,76 @@ public final class RedisSeatAllocator implements SeatAllocator {
         return new AvailabilitySnapshot(pool, range, free.intValue(), false);
     }
 
+    // ------------------------------------------------------------------ reap
+
+    /**
+     * §13.2's sweep: every pool with a {@code holds:} key, reaped by
+     * {@code reap.lua}.
+     *
+     * <p>Discovery is a {@code SCAN}, not an index. Redis deletes a ZSET when its
+     * last member goes, so {@code holds:*} matches only pools that currently hold
+     * something — after a spike, dozens of keys, not the 3,600 provisioned pools.
+     * An index maintained by {@code allocate.lua} would be cheaper to read and would
+     * put a cross-pool write on the hot path T-7 guards, for a job that runs every
+     * five seconds.
+     *
+     * <p>{@code SCAN} may return a key twice. Reaping is idempotent, so that costs a
+     * round trip and nothing else.
+     *
+     * <p>One pool failing does not stop the sweep. Every pool is attempted and the
+     * first failure is rethrown at the end, so a single corrupt key cannot leave
+     * every other idle pool holding expired berths while still being reported.
+     */
+    @Override
+    public int reapExpired(java.time.Instant now) {
+        String nowMs = String.valueOf(now.toEpochMilli());
+        int reaped = 0;
+        RuntimeException firstFailure = null;
+
+        var args = io.lettuce.core.ScanArgs.Builder.matches("holds:*").limit(1_000);
+        io.lettuce.core.KeyScanCursor<String> page = redis.scan(args);
+        while (true) {
+            for (String holdsKey : page.getKeys()) {
+                String suffix = holdsKey.substring("holds:".length());
+                try {
+                    Long removed =
+                            scripts.run("reap", ScriptOutputType.INTEGER, poolKeys(suffix), nowMs);
+                    reaped += removed == null ? 0 : removed.intValue();
+                } catch (RuntimeException e) {
+                    if (firstFailure == null) {
+                        firstFailure = e;
+                    } else {
+                        firstFailure.addSuppressed(e);
+                    }
+                }
+            }
+            if (page.isFinished()) {
+                break;
+            }
+            page = redis.scan(page, args);
+        }
+
+        if (firstFailure != null) {
+            throw firstFailure;
+        }
+        return reaped;
+    }
+
+    /**
+     * One pool's background reap. Public for T-7, which compares it step for step
+     * against {@code BerthPool.reapExpired}; the sweep above is what production
+     * calls.
+     */
+    public int reapExpired(PoolKey pool, java.time.Instant now) {
+        Long removed =
+                scripts.run(
+                        "reap",
+                        ScriptOutputType.INTEGER,
+                        poolKeys(pool),
+                        String.valueOf(now.toEpochMilli()));
+        return removed == null ? 0 : removed.intValue();
+    }
+
     /**
      * A pool's full mask and free-count state.
      *
@@ -329,6 +399,13 @@ public final class RedisSeatAllocator implements SeatAllocator {
 
     private String[] poolKeys(PoolKey pool) {
         return new String[] {masksKey(pool), holdsKey(pool), freeKey(pool), detailKey(pool)};
+    }
+
+    /** The same four keys, from a suffix read off a key name by the sweep. */
+    private static String[] poolKeys(String suffix) {
+        return new String[] {
+            "masks:" + suffix, "holds:" + suffix, "freecount:" + suffix, "holddetail:" + suffix
+        };
     }
 
     private static String masksKey(PoolKey pool) {

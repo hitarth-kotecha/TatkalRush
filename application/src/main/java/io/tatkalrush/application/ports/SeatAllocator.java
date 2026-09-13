@@ -92,4 +92,28 @@ public interface SeatAllocator {
      * {@link #allocate} decides.
      */
     AvailabilitySnapshot availability(PoolKey pool, SegmentRange range);
+
+    /**
+     * Releases every expired hold in every pool this allocator owns (§13.2).
+     *
+     * <p><b>Not a correctness dependency, and must never become one.</b>
+     * {@link #allocate} reaps its own pool before scanning (§9.2), so a pool anyone
+     * is booking from never keeps a lapsed berth, and a reaper that is stalled or
+     * not running cannot lose a seat. This exists for the pool nobody is booking
+     * from: without it, a spike's expired holds stay set in an idle pool
+     * indefinitely, availability under-reports it, and a quiesced invariant check
+     * can never run.
+     *
+     * <p>Where the pools are found is the implementation's business — Strategy A
+     * scans Redis, Strategy B's partition owner reaps what it owns — which is why
+     * this takes no pool.
+     *
+     * <p>Idempotent, and safe to run concurrently with itself and with the lazy
+     * reap: expiry is inclusive ({@code expiresAt <= now}), each pool's reap is
+     * atomic, and a hold reaped twice is freed once. A confirmed booking is never
+     * reached, because {@link #confirm} removed its hold.
+     *
+     * @return holds released
+     */
+    int reapExpired(java.time.Instant now);
 }
