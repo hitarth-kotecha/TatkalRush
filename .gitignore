@@ -30,3 +30,7 @@ Thumbs.db
 loadtest/targets.json
 dependency-reduced-pom.xml
 loadtest/results/
+
+# graphify knowledge graph (graphify-out/). It is regenerated from the source by
+# `graphify update .` and the extraction alone runs to megabytes.
+graphify-out/
