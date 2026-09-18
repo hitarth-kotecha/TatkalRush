@@ -3,8 +3,17 @@
 A railway seat reservation engine built to stay **correct** under extreme, bursty
 write contention — the condition under which most booking systems quietly fail.
 
-> **Status: Phase 0 complete.** The foundation is built and measured. The
-> allocator itself is Phase 1 and is not written yet. See
+> **Status: Phase 0 and Phase 1 complete.** The foundation, the full booking
+> lifecycle (hold → confirm/cancel, payment, PNR), and all twelve invariant
+> checks are built and measured. Phase 2's load-test harness is built but has
+> not yet produced a publishable run on this laptop — see
+> [DD-048](docs/design-decisions.md#dd-048). **Strategy B is built, selectable
+> and provisionable** (`tatkal.allocator.strategy=single-writer`, warmed by
+> `ops/pool-warmup`'s `SwpPoolWarmupMain`) — the request/reply round trip,
+> producer-epoch fencing, the WAL, checkpointing, replay recovery, the dedup
+> cache, and cross-replica hold routing all exist and pass the same contract
+> suite Strategy A does. **Not yet run**: the chaos suite and §9.4's
+> head-to-head comparison, which is the actual point of building it. See
 > [What exists today](#what-exists-today) — nothing below claims otherwise.
 
 ---
@@ -160,8 +169,8 @@ the allocation algorithm.
 
 ## What exists today
 
-Phase 0 is the foundation, and it is complete and measured. **The booking path
-is not built yet.**
+Phase 0 and Phase 1 are complete and measured. **Strategy B, the chaos suite,
+and the head-to-head comparison are not built yet.**
 
 | | Status |
 |---|---|
@@ -175,11 +184,16 @@ is not built yet.**
 | Strategy A: Redis-Lua atomic allocation | ✅ built |
 | Allocator contract suite, T-1 through T-4 | ✅ built |
 | T-7 differential equivalence (Java vs Lua) | ✅ built |
-| **Booking lifecycle, payment, PNR** | Phase 1 |
-| **Twelve invariant checks** | Phase 1 |
-| **Strategy B, chaos suite, comparison** | Phase 2 |
+| Booking lifecycle, payment, PNR (hold → confirm/cancel) | ✅ built |
+| Twelve invariant checks (§14) | ✅ built |
+| Background hold reaper (§13.2) | ✅ built |
+| FR-60 admission control (two-bucket rate limiter) | ✅ built |
+| Load-test harness, P1/P2 profiles | 🔧 built, not yet publishable — [DD-048](docs/design-decisions.md#dd-048) |
+| Strategy B: round trip, fencing, WAL, checkpointing, replay, dedup, cross-replica routing, selectable via `tatkal.allocator.strategy` | ✅ built |
+| Strategy B pool provisioning (`ops/pool-warmup`'s `SwpPoolWarmupMain`) | ✅ built |
+| **Chaos suite, §9.4 comparison report** | Phase 2 |
 | **RAC/WL, chart preparation** | Phase 3a |
-| **Admission control, React dashboard** | Phase 3b |
+| **React dashboard** | Phase 3b |
 
 ### Phase 0 acceptance
 

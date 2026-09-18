@@ -1,15 +1,10 @@
 package io.tatkalrush.ops.warmup;
 
 import io.tatkalrush.adapters.allocatorredis.RedisSeatAllocator;
-import io.tatkalrush.domain.inventory.PoolKey;
-import io.tatkalrush.domain.inventory.QuotaType;
-import io.tatkalrush.domain.inventory.TravelClass;
+import io.tatkalrush.ops.warmup.PoolShapeReader.PoolShape;
 import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -70,10 +65,6 @@ public final class PoolRebuilder {
             List<String> shapeWarnings,
             long elapsedMillis) {}
 
-    /** One pool's shape, as Postgres has it. */
-    private record PoolShape(
-            long poolId, PoolKey key, int berthCount, int maxOrdinal, int declaredBerths, int segmentCount) {}
-
     private final Connection connection;
     private final RedisSeatAllocator allocator;
 
@@ -85,17 +76,17 @@ public final class PoolRebuilder {
     public Result rebuildAll() throws SQLException {
         long started = System.currentTimeMillis();
 
-        List<PoolShape> shapes = poolShapes();
+        List<PoolShape> shapes = PoolShapeReader.poolShapes(connection);
         var replayed = new int[1];
-        Map<Long, long[]> masksByPool = occupiedMasks(shapes, replayed);
-        Map<Long, List<Long>> berthIdsByPool = berthIds(shapes);
+        Map<Long, long[]> masksByPool = PoolShapeReader.occupiedMasks(connection, shapes, replayed);
+        Map<Long, List<Long>> berthIdsByPool = PoolShapeReader.berthIds(connection, shapes);
 
         int berths = 0;
         int provisioned = 0;
         var warnings = new ArrayList<String>();
 
         for (PoolShape shape : shapes) {
-            warnings.addAll(shapeProblems(shape));
+            warnings.addAll(PoolShapeReader.shapeProblems(shape));
 
             long[] masks = masksByPool.get(shape.poolId());
             var occupied = new ArrayList<String>();
@@ -142,259 +133,5 @@ public final class PoolRebuilder {
                 replayed[0],
                 List.copyOf(warnings),
                 System.currentTimeMillis() - started);
-    }
-
-    /**
-     * Berth count comes from {@code pool_berths}, not from
-     * {@code quota_pools.total_berths}.
-     *
-     * <p>{@code pool_ordinal} is what the allocator addresses a mask slot by, so
-     * the number of rows in {@code pool_berths} is the number of slots that can
-     * exist. {@code total_berths} is a declaration; if the two disagree the
-     * declaration is the one that is wrong, and provisioning to it would either
-     * strand berths past the end of the mask array or create slots nothing maps to.
-     *
-     * <p>{@code max(seq)} is the segment count — a route of N stops has segments
-     * {@code 0..N-2} and {@code seq} is 0-based. Wrong here and every
-     * {@code availability} call fails its own length check inside Lua.
-     */
-    private List<PoolShape> poolShapes() throws SQLException {
-        String sql =
-                """
-                SELECT q.id            AS pool_id,
-                       q.schedule_id,
-                       q.travel_class,
-                       q.quota_type,
-                       q.total_berths,
-                       count(pb.berth_id)     AS berth_count,
-                       max(pb.pool_ordinal)   AS max_ordinal,
-                       (SELECT max(seq) FROM train_stops ts WHERE ts.train_id = s.train_id)
-                           AS segment_count
-                FROM quota_pools q
-                JOIN schedules s   ON s.id = q.schedule_id
-                JOIN pool_berths pb ON pb.pool_id = q.id
-                WHERE s.status IN ('OPEN', 'CHARTED')
-                GROUP BY q.id, q.schedule_id, q.travel_class, q.quota_type,
-                         q.total_berths, s.train_id
-                ORDER BY q.id
-                """;
-
-        var shapes = new ArrayList<PoolShape>();
-        try (PreparedStatement ps = connection.prepareStatement(sql);
-                ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                shapes.add(
-                        new PoolShape(
-                                rs.getLong("pool_id"),
-                                new PoolKey(
-                                        rs.getLong("schedule_id"),
-                                        TravelClass.fromCode(rs.getString("travel_class")),
-                                        QuotaType.fromCode(rs.getString("quota_type"))),
-                                rs.getInt("berth_count"),
-                                rs.getInt("max_ordinal"),
-                                rs.getInt("total_berths"),
-                                rs.getInt("segment_count")));
-            }
-        }
-        return shapes;
-    }
-
-    /**
-     * Confirmed allocations, folded into one mask per berth.
-     *
-     * <p>No booking-status filter, and that is a fact about the schema rather than
-     * an omission: {@code CancelBooking} deletes allocation rows in the same
-     * transaction as the status change, precisely so this rebuild cannot
-     * re-occupy a cancelled berth. Every surviving row is live.
-     *
-     * <p>Bits are OR-ed rather than assigned. T-3's complementary journeys put two
-     * bookings on one berth over disjoint ranges, and assignment would keep
-     * whichever the planner returned last.
-     *
-     * @param replayed out-parameter counting <em>rows</em> folded in. Counted here
-     *     rather than at provisioning time because the caller sees only the
-     *     resulting masks, and two complementary bookings on one berth produce one
-     *     non-zero mask — so counting there would report "1 allocation replayed"
-     *     for two, which is what {@code complementaryJourneysShareOneBerth} caught.
-     */
-    private Map<Long, long[]> occupiedMasks(List<PoolShape> shapes, int[] replayed)
-            throws SQLException {
-        var sizeByPool = new LinkedHashMap<Long, Integer>();
-        for (PoolShape shape : shapes) {
-            sizeByPool.put(shape.poolId(), shape.berthCount());
-        }
-
-        String sql =
-                """
-                SELECT q.id              AS pool_id,
-                       pb.pool_ordinal,
-                       lower(sa.seg_range) AS from_seq,
-                       upper(sa.seg_range) AS to_seq
-                FROM seat_allocations sa
-                JOIN bookings b     ON b.id = sa.booking_id
-                JOIN quota_pools q  ON q.schedule_id  = sa.schedule_id
-                                   AND q.travel_class = b.travel_class
-                                   AND q.quota_type   = b.quota_type
-                JOIN pool_berths pb ON pb.pool_id = q.id AND pb.berth_id = sa.berth_id
-                """;
-
-        var masks = new LinkedHashMap<Long, long[]>();
-        try (PreparedStatement ps = connection.prepareStatement(sql);
-                ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                long poolId = rs.getLong("pool_id");
-                Integer size = sizeByPool.get(poolId);
-                if (size == null) {
-                    // A pool on a DEPARTED or CANCELLED schedule. Not provisioned,
-                    // so there is no mask array to write into.
-                    continue;
-                }
-                int ordinal = rs.getInt("pool_ordinal");
-                if (ordinal < 0 || ordinal >= size) {
-                    continue;
-                }
-                long[] pool = masks.computeIfAbsent(poolId, id -> new long[size]);
-                for (int seg = rs.getInt("from_seq"); seg < rs.getInt("to_seq"); seg++) {
-                    pool[ordinal] |= 1L << seg;
-                }
-                replayed[0]++;
-            }
-        }
-        return masks;
-    }
-
-    /**
-     * Each pool's {@code pool_ordinal -> berths.id} mapping.
-     *
-     * <p>This is the fact the allocator cannot derive and used to invent. Real ids
-     * live in {@code pool_berths}; the previous {@code scheduleId * 1000 + ordinal}
-     * produced ids that were accepted by the foreign key often enough to record the
-     * wrong berth silently, and rejected the rest of the time as a 500.
-     *
-     * <p><b>Each id is placed at its own ordinal</b> rather than appended in query
-     * order. Appending would make the mapping depend on an {@code ORDER BY} —
-     * correct, but silently wrong the moment the ordinals are not contiguous, since
-     * ordinals {@code 0,1,5} would produce three ids at indices {@code 0,1,2} and
-     * put a berth nobody asked for at ordinal 2. Placing by index cannot be wrong
-     * about order, and a gap becomes visible as an unfilled slot.
-     *
-     * <p>One query for every pool rather than one per pool: 3,600 pools on the
-     * seeded dataset, and the round trips would dominate a warm-up that otherwise
-     * takes eight seconds.
-     *
-     * @return ids by ordinal, or an entry absent entirely when the pool's ordinals
-     *     do not cover {@code 0..berthCount-1}
-     */
-    private Map<Long, List<Long>> berthIds(List<PoolShape> shapes) throws SQLException {
-        var sizes = new LinkedHashMap<Long, Integer>();
-        for (PoolShape shape : shapes) {
-            sizes.put(shape.poolId(), shape.berthCount());
-        }
-
-        String sql =
-                """
-                SELECT pb.pool_id, pb.pool_ordinal, pb.berth_id
-                FROM pool_berths pb
-                JOIN quota_pools q ON q.id = pb.pool_id
-                JOIN schedules s   ON s.id = q.schedule_id
-                WHERE s.status IN ('OPEN', 'CHARTED')
-                ORDER BY pb.pool_id, pb.berth_id
-                """;
-
-        // Ordered by BERTH ID, deliberately not by pool_ordinal. Placing each id at
-        // its own ordinal makes this loop independent of arrival order, and the
-        // only way to demonstrate that independence is to feed it an order that is
-        // not the answer. A mapping whose ordinals run opposite to its ids - which
-        // pool_berths permits - comes out right anyway.
-        //
-        // 0 is a legal berth id in principle, so an unfilled slot needs a value no
-        // real id can take. -1 works because berths.id is a BIGSERIAL.
-        var byPool = new LinkedHashMap<Long, long[]>();
-        try (PreparedStatement ps = connection.prepareStatement(sql);
-                ResultSet rs = ps.executeQuery()) {
-            while (rs.next()) {
-                long poolId = rs.getLong("pool_id");
-                Integer size = sizes.get(poolId);
-                if (size == null) {
-                    continue;
-                }
-                int ordinal = rs.getInt("pool_ordinal");
-                if (ordinal < 0 || ordinal >= size) {
-                    // Out of range for this pool's mask array. Left out, which
-                    // shows up below as an unfilled slot and refuses the pool.
-                    continue;
-                }
-                long[] ids =
-                        byPool.computeIfAbsent(
-                                poolId,
-                                id -> {
-                                    var fresh = new long[size];
-                                    java.util.Arrays.fill(fresh, -1L);
-                                    return fresh;
-                                });
-                ids[ordinal] = rs.getLong("berth_id");
-            }
-        }
-
-        var complete = new LinkedHashMap<Long, List<Long>>();
-        for (var entry : byPool.entrySet()) {
-            long[] ids = entry.getValue();
-            boolean full = true;
-            for (long id : ids) {
-                if (id < 0) {
-                    full = false;
-                    break;
-                }
-            }
-            if (full) {
-                var boxed = new ArrayList<Long>(ids.length);
-                for (long id : ids) {
-                    boxed.add(id);
-                }
-                complete.put(entry.getKey(), List.copyOf(boxed));
-            }
-        }
-        return complete;
-    }
-
-    /**
-     * Reported rather than thrown.
-     *
-     * <p>A shape problem makes one pool wrong; refusing to provision the other
-     * several thousand because of it would turn a data oddity into an outage. The
-     * caller prints these and decides.
-     */
-    private static List<String> shapeProblems(PoolShape shape) {
-        var problems = new ArrayList<String>(0);
-
-        if (shape.maxOrdinal() != shape.berthCount() - 1) {
-            // pool_ordinal is documented as 0-based and contiguous. A gap means
-            // some mask slot maps to no berth, and an allocation landing there
-            // would confirm a booking onto a berth that does not exist.
-            //
-            // The parentheses around the concatenation are load-bearing: .formatted
-            // binds to the last literal alone, so without them the earlier fragment
-            // is prepended to an already-formatted tail and the %s placeholders in
-            // it survive into the message. That is exactly how this read on its
-            // first run.
-            problems.add(
-                    ("pool=%s: %d pool_berths rows but max(pool_ordinal)=%d - ordinals are"
-                                    + " not contiguous from zero")
-                            .formatted(shape.key(), shape.berthCount(), shape.maxOrdinal()));
-        }
-        if (shape.declaredBerths() != shape.berthCount()) {
-            problems.add(
-                    ("pool=%s: quota_pools.total_berths=%d but %d pool_berths rows -"
-                                    + " provisioning to the rows")
-                            .formatted(
-                                    shape.key(), shape.declaredBerths(), shape.berthCount()));
-        }
-        if (shape.segmentCount() <= 0 || shape.segmentCount() > 63) {
-            // A long has 64 bits whatever the route's length (FR-3a, DD-002).
-            problems.add(
-                    "pool=%s: segmentCount=%d is outside 1..63"
-                            .formatted(shape.key(), shape.segmentCount()));
-        }
-        return problems;
     }
 }

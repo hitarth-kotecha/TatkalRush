@@ -34,6 +34,16 @@
       <artifactId>allocator-redis</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!--
+      Strategy B's own warmup path (SDD 9.3, milestone 7): KafkaSeatAllocator
+      has no production caller either, for the same reason RedisSeatAllocator
+      did not - see SwpPoolProvisioner's class Javadoc.
+    -->
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>allocator-swp</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-jdbc</artifactId>
@@ -93,6 +103,16 @@
     <dependency>
       <groupId>org.testcontainers</groupId>
       <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!--
+      For SwpPoolProvisionerTest. Not in spring-boot-dependencies' managed set -
+      see allocator-swp/pom.xml for why this is pinned explicitly.
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-kafka</artifactId>
+      <version>2.0.5</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
