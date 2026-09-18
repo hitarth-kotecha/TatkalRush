@@ -8,6 +8,9 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.tatkalrush.adapters.allocatorredis.RedisAvailabilityCache;
 import io.tatkalrush.adapters.allocatorredis.RedisSeatAllocator;
+import io.tatkalrush.adapters.allocatorswp.JdbcCheckpointStore;
+import io.tatkalrush.adapters.allocatorswp.JdbcHoldRoutingStore;
+import io.tatkalrush.adapters.allocatorswp.KafkaSeatAllocator;
 import io.tatkalrush.admission.RedisRateLimiter;
 import io.tatkalrush.adapters.paymentsim.HttpPaymentGateway;
 import io.tatkalrush.adapters.paymentsim.WebhookSigner;
@@ -48,6 +51,7 @@ import javax.sql.DataSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Profile;
@@ -176,13 +180,54 @@ public class ApplicationWiring {
     }
 
     /**
-     * §9.4's swap point. Strategy A today; Strategy B replaces this one bean and
-     * nothing above it changes, which is what makes the comparison controlled
-     * rather than a rewrite with a different name.
+     * §9.4's swap point. Exactly one of these two beans is ever registered —
+     * {@code @ConditionalOnProperty} excludes the other one from the context
+     * entirely, so nothing above or below either bean has to change to swap
+     * strategies, and {@code getBeanNamesForType(SeatAllocator.class)} still
+     * finds exactly one allocator either way (see {@code ProfileContextTest}).
      */
     @Bean
-    SeatAllocator seatAllocator(RedisCommands<String, String> redis) {
+    @ConditionalOnProperty(
+            name = "tatkal.allocator.strategy",
+            havingValue = "redis-lua",
+            matchIfMissing = true)
+    SeatAllocator redisLuaSeatAllocator(RedisCommands<String, String> redis) {
         return new RedisSeatAllocator(redis);
+    }
+
+    /**
+     * Strategy B (§9.3). {@code KafkaSeatAllocator} is a {@code SmartLifecycle},
+     * not started here — same reason as {@link #holdReaper}: starting its
+     * background consumer threads inside this factory method would let its
+     * first checkpoint or hold-routing write reach Postgres before Flyway has
+     * migrated {@code checkpoints}/{@code hold_routing} on a cold stack, which
+     * is exactly the incident {@code HoldReaper}'s Javadoc documents. Spring
+     * starts it once the context has finished refreshing instead.
+     *
+     * <p>Topics ({@code tatkalrush.swp.*-topic}) are assumed to already exist —
+     * this class does not create them, the same way it does not run Flyway.
+     * See {@code ops/pool-warmup} for the equivalent gap on the Strategy A
+     * side: pool provisioning is external tooling, not app-runtime code, and
+     * Strategy B needs its own version of that tool before this bean is
+     * useful in a real deployment (open, tracked separately from this wiring).
+     */
+    @Bean
+    @ConditionalOnProperty(name = "tatkal.allocator.strategy", havingValue = "single-writer")
+    SeatAllocator singleWriterSeatAllocator(
+            DataSource dataSource,
+            @Value("${spring.kafka.bootstrap-servers:localhost:9092}") String bootstrapServers,
+            @Value("${tatkalrush.swp.commands-topic:booking-commands}") String commandsTopic,
+            @Value("${tatkalrush.swp.events-topic:booking-events}") String eventsTopic,
+            @Value("${tatkalrush.swp.replies-topic:booking-replies}") String repliesTopic,
+            @Value("${tatkalrush.swp.reply-timeout-ms:10000}") long replyTimeoutMillis) {
+        return new KafkaSeatAllocator(
+                bootstrapServers,
+                commandsTopic,
+                eventsTopic,
+                repliesTopic,
+                Duration.ofMillis(replyTimeoutMillis),
+                new JdbcCheckpointStore(dataSource),
+                new JdbcHoldRoutingStore(dataSource));
     }
 
     @Bean

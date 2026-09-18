@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.tatkalrush.adapters.allocatorredis.RedisSeatAllocator;
+import io.tatkalrush.adapters.allocatorswp.KafkaSeatAllocator;
 import io.tatkalrush.adapters.web.RateLimitFilter;
 import io.tatkalrush.adapters.web.SearchController;
 import io.tatkalrush.application.ports.RateLimiter;
@@ -18,7 +20,9 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.kafka.KafkaContainer;
 import org.testcontainers.postgresql.PostgreSQLContainer;
+import org.testcontainers.utility.DockerImageName;
 
 /**
  * Both roles §8.3 runs from one image actually start.
@@ -53,9 +57,21 @@ class ProfileContextTest {
     static final GenericContainer<?> REDIS =
             new GenericContainer<>("redis:7-alpine").withExposedPorts(6379);
 
+    // Same image compose.yaml pins (§8.3). Only the single-writer strategy
+    // case below needs this, but @DynamicPropertySource is one method for the
+    // whole file - REDIS above is already started unconditionally for every
+    // nested class the same way, including psp-sim, which does not need it
+    // either.
+    @SuppressWarnings("resource")
+    static final KafkaContainer KAFKA =
+            new KafkaContainer(
+                    DockerImageName.parse(
+                            "apache/kafka@sha256:d50ab7b5df612b3c303f9d8afe8fee59626a5de798addfd626fe1924e3205965"));
+
     static {
         POSTGRES.start();
         REDIS.start();
+        KAFKA.start();
     }
 
     @DynamicPropertySource
@@ -67,6 +83,7 @@ class ProfileContextTest {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.kafka.bootstrap-servers", KAFKA::getBootstrapServers);
         registry.add("spring.data.redis.host", REDIS::getHost);
         registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
     }
@@ -137,6 +154,67 @@ class ProfileContextTest {
                     "the reaper was sweeping before the context (and Flyway) had finished");
             assertTrue(
                     context.getBean(HoldReaper.class).isRunning(),
+                    "and once the context is up, it must actually be running");
+        }
+    }
+
+    /**
+     * Same purpose as {@link ReaperCreationObserver}, for {@link KafkaSeatAllocator}
+     * (milestone 6): it is a {@code SmartLifecycle} for the identical reason
+     * {@code HoldReaper} is one - a plain eager bean starting Kafka consumer
+     * threads that write {@code checkpoints}/{@code hold_routing} could reach
+     * Postgres before Flyway has migrated either table.
+     */
+    static class AllocatorCreationObserver {
+        static final java.util.concurrent.atomic.AtomicReference<Boolean> runningWhenCreated =
+                new java.util.concurrent.atomic.AtomicReference<>();
+
+        @org.springframework.context.annotation.Bean
+        static org.springframework.beans.factory.config.BeanPostProcessor allocatorObserver() {
+            return new org.springframework.beans.factory.config.BeanPostProcessor() {
+                @Override
+                public Object postProcessAfterInitialization(Object bean, String name) {
+                    if (bean instanceof KafkaSeatAllocator allocator) {
+                        runningWhenCreated.set(allocator.isRunning());
+                    }
+                    return bean;
+                }
+            };
+        }
+    }
+
+    @Nested
+    @SpringBootTest(
+            webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+            properties = "tatkal.allocator.strategy=single-writer")
+    @org.springframework.context.annotation.Import(AllocatorCreationObserver.class)
+    @DisplayName("app-1/app-2 with tatkal.allocator.strategy=single-writer (SDD 9.3, milestone 6)")
+    class SingleWriterStrategy {
+
+        @Autowired ApplicationContext context;
+
+        @Test
+        void theContextStarts() {
+            assertTrue(context.containsBean("searchTrains"));
+        }
+
+        @Test
+        void exactlyOneAllocatorIsWiredAndItIsStrategyB() {
+            assertEquals(1, context.getBeanNamesForType(SeatAllocator.class).length);
+            assertEquals(0, context.getBeanNamesForType(RedisSeatAllocator.class).length);
+            assertEquals(1, context.getBeanNamesForType(KafkaSeatAllocator.class).length);
+        }
+
+        /** Mirrors {@code theReaperStartsAfterTheContextNotDuringIt} - same incident, same fix. */
+        @Test
+        void theAllocatorStartsAfterTheContextNotDuringIt() {
+            assertEquals(
+                    Boolean.FALSE,
+                    AllocatorCreationObserver.runningWhenCreated.get(),
+                    "the allocator's Kafka consumers were already running before the context"
+                            + " (and Flyway) had finished");
+            assertTrue(
+                    context.getBean(KafkaSeatAllocator.class).isRunning(),
                     "and once the context is up, it must actually be running");
         }
     }
