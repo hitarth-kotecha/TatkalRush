@@ -30,8 +30,68 @@
       <artifactId>spring-kafka</artifactId>
     </dependency>
     <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+    <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      The contract suite from application's test-jar. Extended, never copied
+      (AC-2.1) - see allocator-redis/pom.xml for why.
+    -->
+    <dependency>
+      <groupId>io.tatkalrush</groupId>
+      <artifactId>application</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      A real Kafka, not a fake. §9.3's correctness rests on real consumer-group
+      partition assignment, which nothing in-memory can stand in for.
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-kafka</artifactId>
+      <!--
+        Not in spring-boot-dependencies' managed set (only testcontainers core and
+        testcontainers-junit-jupiter are), so pinned explicitly - matching
+        ${testcontainers.version} from that BOM (2.0.5). Testcontainers 2.x
+        renamed the module artifact from "kafka" to "testcontainers-kafka".
+      -->
+      <version>2.0.5</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

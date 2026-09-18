@@ -349,6 +349,90 @@ public final class BerthPool {
         return masks.clone();
     }
 
+    // -------------------------------------------------------- replay/checkpoint
+
+    /**
+     * One live hold's exact state, for checkpointing and replay. Not a view —
+     * {@link #liveHolds()} returns copies, same reasoning as {@link #snapshotMasks}.
+     */
+    public record HoldSnapshot(
+            String holdId, List<Integer> berthOrdinals, long requestMask, Instant expiresAt) {}
+
+    /** Every currently-live hold, for a checkpoint write. */
+    public List<HoldSnapshot> liveHolds() {
+        var snapshot = new ArrayList<HoldSnapshot>(holds.size());
+        for (var entry : holds.entrySet()) {
+            Hold hold = entry.getValue();
+            snapshot.add(
+                    new HoldSnapshot(
+                            entry.getKey(), hold.berthOrdinals(), hold.requestMask(), hold.expiresAt()));
+        }
+        return snapshot;
+    }
+
+    /**
+     * Rebuilds a pool from a checkpoint or WAL replay: the masks and live holds
+     * exactly as recorded, with free counts <b>recomputed</b> from the masks
+     * rather than also persisted — the two must never be allowed to disagree
+     * (INV-12 exists precisely because seven mutating call sites can let them
+     * drift), and a value derivable from what is already being restored is one
+     * fewer thing that can be restored inconsistently.
+     *
+     * <p>Not validated against {@link #allocate}'s invariants (no overlap check,
+     * no TTL check): the WAL already proved this state was reached legitimately.
+     * Revalidating it here would mean replay could reject a state production
+     * itself produced.
+     */
+    public static BerthPool restore(int segmentCount, long[] masks, List<HoldSnapshot> liveHolds) {
+        var pool = new BerthPool(masks.length, segmentCount);
+        System.arraycopy(masks, 0, pool.masks, 0, masks.length);
+
+        for (int seg = 0; seg < segmentCount; seg++) {
+            long bit = 1L << seg;
+            int free = 0;
+            for (long mask : pool.masks) {
+                if ((mask & bit) == 0) {
+                    free++;
+                }
+            }
+            pool.freeCount[seg] = free;
+        }
+
+        for (HoldSnapshot hold : liveHolds) {
+            pool.holds.put(
+                    hold.holdId(),
+                    new Hold(List.copyOf(hold.berthOrdinals()), hold.requestMask(), hold.expiresAt()));
+        }
+        return pool;
+    }
+
+    /**
+     * Reconstructs a hold exactly as {@link #allocate} would have left it,
+     * <b>without</b> searching for free berths — replay only.
+     *
+     * <p>§9.3 is explicit about why: "each AllocationEvent carries its commandId
+     * and allocated berths." Re-running the search against reconstructed state
+     * and hoping it picks the same berths is not replay, it is a second,
+     * unrelated allocation attempt that happens to be fed the same request — and
+     * nothing guarantees it would even succeed, let alone agree.
+     *
+     * @throws IllegalStateException if {@code holdId} is already live — a WAL
+     *     that logs the same allocation twice for one partition is corrupt, and
+     *     replay must not silently paper over that
+     */
+    public void restoreHold(
+            String holdId, List<Integer> berthOrdinals, SegmentRange range, Instant expiresAt) {
+        if (holds.containsKey(holdId)) {
+            throw new IllegalStateException("replay: hold already restored: " + holdId);
+        }
+        long requestMask = range.mask();
+        for (int ordinal : berthOrdinals) {
+            masks[ordinal] = SegmentMask.allocate(masks[ordinal], requestMask);
+        }
+        adjustFreeCounts(range, -berthOrdinals.size());
+        holds.put(holdId, new Hold(List.copyOf(berthOrdinals), requestMask, expiresAt));
+    }
+
     // ------------------------------------------------------------ invariants
 
     /**

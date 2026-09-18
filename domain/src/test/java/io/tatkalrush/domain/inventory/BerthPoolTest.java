@@ -433,4 +433,56 @@ class BerthPoolTest {
             pool.checkInvariants();
         }
     }
+
+    @Nested
+    @DisplayName("replay/checkpoint (§9.3 milestone 3)")
+    class Replay {
+
+        @Test
+        @DisplayName("restore reproduces a live pool's masks, free counts and live holds exactly")
+        void restoreReproducesLiveState() {
+            var original = new BerthPool(4, 4);
+            allocated(original.allocate(SegmentRange.of(0, 2), 1, "a", T0, TTL));
+            allocated(original.allocate(SegmentRange.of(2, 4), 2, "b", T0, TTL));
+            original.confirm("a"); // a confirmed hold has no HoldSnapshot, only mask bits
+
+            var restored =
+                    BerthPool.restore(original.segmentCount(), original.snapshotMasks(), original.liveHolds());
+
+            assertEquals(original.freeOn(SegmentRange.of(0, 4)), restored.freeOn(SegmentRange.of(0, 4)));
+            assertEquals(original.remainingBerths(), restored.remainingBerths());
+            assertEquals(original.berthsOf("b"), restored.berthsOf("b"));
+            assertEquals(List.of(), restored.berthsOf("a"), "confirmed hold: no live hold to restore");
+            restored.checkInvariants();
+
+            // The confirmed booking's berth 0 must still be occupied on segment 0
+            // - it lives in the masks, not in liveHolds(), and restore() must not
+            // have dropped it.
+            assertEquals(original.maskAt(0), restored.maskAt(0));
+        }
+
+        @Test
+        @DisplayName("restoreHold sets exactly the recorded berths, with no search")
+        void restoreHoldSetsRecordedBerthsExactly() {
+            var pool = new BerthPool(4, 4);
+            var expiresAt = T0.plusMillis(TTL);
+
+            pool.restoreHold("replayed", List.of(2), SegmentRange.of(0, 4), expiresAt);
+
+            assertEquals(List.of(2), pool.berthsOf("replayed"));
+            assertEquals(3, pool.remainingBerths(), "berths 0, 1 and 3 remain free");
+            pool.checkInvariants();
+        }
+
+        @Test
+        @DisplayName("restoreHold refuses to restore the same hold twice")
+        void restoreHoldRejectsDuplicate() {
+            var pool = new BerthPool(4, 4);
+            pool.restoreHold("h", List.of(0), SegmentRange.of(0, 4), T0.plusMillis(TTL));
+
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> pool.restoreHold("h", List.of(1), SegmentRange.of(0, 4), T0.plusMillis(TTL)));
+        }
+    }
 }
