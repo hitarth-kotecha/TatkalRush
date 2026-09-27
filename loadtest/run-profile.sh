@@ -24,6 +24,7 @@
 # Usage:
 #   ./loadtest/run-profile.sh p1 [base-url]
 #   ./loadtest/run-profile.sh p2 [base-url]
+#   ./loadtest/run-profile.sh p3 [base-url]
 set -uo pipefail
 
 PROFILE="${1:-}"
@@ -37,7 +38,8 @@ RESULTS="$HERE/results"
 case "$PROFILE" in
   p1) SCRIPT="$HERE/profiles/p1-tatkal-spike.js" ;;
   p2) SCRIPT="$HERE/profiles/p2-sustained-mixed.js" ;;
-  *)  echo "usage: $0 {p1|p2} [base-url]" >&2; exit 2 ;;
+  p3) SCRIPT="$HERE/profiles/p3-hot-partition.js" ;;
+  *)  echo "usage: $0 {p1|p2|p3} [base-url]" >&2; exit 2 ;;
 esac
 
 REDIS_PORT="${TATKAL_REDIS_PORT:-6379}"   # compose.yaml: Windows can reserve 6379
@@ -48,10 +50,17 @@ SETTLE_SECONDS="${SETTLE_SECONDS:-15}"
 # TTL (FR-20), and INV-5 judges hold expiries on the system's clock. A script that
 # trusted its own copy ran INV-5 on the host clock against a P40D stack, and the
 # check passed having examined nothing.
-APP_ENV="$(docker compose exec -T app-1 sh -c 'echo "$TATKALRUSH_HOLD_TTLMS $TATKALRUSH_CLOCK_OFFSET"' 2>/dev/null | tr -d '\r')"
-read -r APP_TTL_MS APP_CLOCK_OFFSET <<<"$APP_ENV"
+APP_ENV="$(docker compose exec -T app-1 sh -c 'echo "$TATKALRUSH_HOLD_TTLMS $TATKALRUSH_CLOCK_OFFSET $TATKAL_ALLOCATOR_STRATEGY"' 2>/dev/null | tr -d '\r')"
+read -r APP_TTL_MS APP_CLOCK_OFFSET APP_ALLOCATOR_STRATEGY <<<"$APP_ENV"
 [ -n "${APP_TTL_MS:-}" ] || { echo "cannot read TATKALRUSH_HOLD_TTLMS from app-1 - is the stack up?" >&2; exit 1; }
 APP_CLOCK_OFFSET="${APP_CLOCK_OFFSET:-PT0S}"
+# ApplicationWiring's @ConditionalOnProperty defaults to redis-lua when the
+# property is absent (matchIfMissing = true) - unset here means the same thing
+# it means there, not "unknown". AC-2.3 and AC-2.5's comparison report need to
+# know which strategy a result came from without an operator tracking it by
+# hand, so it travels with the result JSON rather than living only in whichever
+# shell started the stack.
+APP_ALLOCATOR_STRATEGY="${APP_ALLOCATOR_STRATEGY:-redis-lua}"
 HOLD_TTL_SECONDS=$((APP_TTL_MS / 1000))
 
 # §13.2's reaper sweeps every 5 s, so a drained system is at most TTL + one sweep
@@ -80,6 +89,7 @@ echo "================================================================"
 echo " base url        : $BASE"
 echo " hold TTL        : ${HOLD_TTL_SECONDS}s  (from app-1; DD-044 shortens it for benchmark runs)"
 echo " clock offset    : ${APP_CLOCK_OFFSET}  (from app-1; FR-31)"
+echo " allocator       : ${APP_ALLOCATOR_STRATEGY}  (from app-1; §9.4's swap point)"
 echo " quiesce         : until drained, at most ${QUIESCE_TIMEOUT_SECONDS}s"
 echo " run id          : $RUN_ID"
 
@@ -87,7 +97,11 @@ echo " run id          : $RUN_ID"
 # script. FR-28's rule is IST calendar arithmetic and reimplementing it in bash
 # would be a second definition that drifts; asking the app which pools it reports
 # as bookable is asking the thing that decides.
-if [ "$PROFILE" = "p1" ]; then
+#
+# P3 needs this exactly as P1 does: hotTarget() (lib/api.js) filters to the same
+# open date, and without TATKAL_DATE set it would throw rather than silently
+# target a closed pool.
+if [ "$PROFILE" = "p1" ] || [ "$PROFILE" = "p3" ]; then
   printf ' open Tatkal date: '
   TATKAL_DATE="$("${PSQL[@]}" -tAc "
     SELECT to_char(min(s.journey_date), 'YYYY-MM-DD')
@@ -161,6 +175,17 @@ fi
 
 [ -s "$OUT_JSON" ] || { echo " k6 produced no result" >&2; exit 1; }
 
+# Which allocator produced this result, folded in before anything else touches
+# the file - AC-2.3's comparison has two of these per profile and nothing else
+# in the JSON says which is which.
+python - "$OUT_JSON" "$APP_ALLOCATOR_STRATEGY" <<'ENDPY'
+import json, sys
+out, strategy = sys.argv[1], sys.argv[2]
+d = json.load(open(out))
+d["allocator_strategy"] = strategy
+json.dump(d, open(out, "w"), indent=2)
+ENDPY
+
 # Folded into the result JSON, so the numbers travel with the run (NFR-12).
 python - "$OUT_JSON" "$HOST_CSV" <<'ENDPY'
 import csv, json, os, sys
@@ -183,11 +208,12 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 rows = [
     ("profile", d.get("profile")),
+    ("allocator", d.get("allocator_strategy", "unknown")),
     ("VUs", "%d" % d.get("vus", 0)),
     ("achieved rps", "%.1f" % d.get("achieved_rps", 0)),
     ("dropped iterations", d.get("dropped_iterations", 0)),
 ]
-if d.get("profile") == "P1":
+if d.get("profile") in ("P1", "P3"):
     rows += [("hold p50/p95/p99 ms", "%.1f / %.1f / %.1f" % (d["p50_ms"], d["p95_ms"], d["p99_ms"]))]
 else:
     rows += [

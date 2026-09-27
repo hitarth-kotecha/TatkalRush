@@ -234,6 +234,39 @@ export function tatkalPoolCount() {
   return tatkalPools.length;
 }
 
+/**
+ * The single (train, date, class) pool P3 concentrates 100% of its load onto
+ * (§19.1). FR-49 designates three trains "hot"; `extract-targets.sh` carries
+ * that flag into `targets.json` as `hot`. This picks the FIRST hot TATKAL pool
+ * on the open date - fixed, not random, for the same reason SeedGenerator fixes
+ * which trains are hot: a load profile should be able to name its target
+ * without reading the database first, and two runs of the same profile should
+ * differ in their numbers and nowhere else.
+ *
+ * Deliberately not spread (contrast `tatkalTarget`). Spreading across the hot
+ * pools would measure three partitions under a third of the load each - a
+ * different, easier question. Concentrating on one is the point of P3: it is
+ * the only profile built to make Strategy A and Strategy B disagree.
+ */
+const hotTatkalPools = new SharedArray('hotTatkal', function () {
+  const doc = JSON.parse(open('../targets.json'));
+  const date = __ENV.TATKAL_DATE || '';
+  const pools = doc.targets.filter(function (t) {
+    return t.hot && t.quota_type === 'TATKAL' && (date === '' || t.journey_date === date);
+  });
+  if (pools.length === 0) {
+    throw new Error(
+      `no hot TATKAL targets for date "${date}". P3 needs an open window (AC-1.11), ` +
+        'same as P1: start the stack with TATKAL_CLOCK_OFFSET and pass the matching TATKAL_DATE.',
+    );
+  }
+  return pools;
+});
+
+export function hotTarget() {
+  return hotTatkalPools[0];
+}
+
 // ── requests ────────────────────────────────────────────────────────────────
 
 export function search(target) {
