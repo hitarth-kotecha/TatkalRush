@@ -68,6 +68,22 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-035](#dd-035) | A correct outcome that must not persist needs a rollback that is not an exception | 1 |
 | [DD-036](#dd-036) | The PSP draws its verdict once, at charge time | 1 |
 | [DD-037](#dd-037) | Cancelling a confirmed booking needs an allocator operation that did not exist | 1 |
+| [DD-038](#dd-038) | FR-15 caches the number, not the response | 1 |
+| [DD-039](#dd-039) | Search is authenticated and rate-limited | 1 |
+| [DD-040](#dd-040) | §13.4's rebuild is an explicit operation, not lazy initialisation | 1 |
+| [DD-041](#dd-041) | The clock moves, the dataset does not | 1 |
+| [DD-042](#dd-042) | Berth ids are stored, not derived | 1 |
+| [DD-043](#dd-043) | The load harness is a measuring instrument, and it needed calibrating too | 1 |
+| [DD-044](#dd-044) | Benchmark runs shorten the hold TTL to 15 s, and say so | 1 |
+| [DD-045](#dd-045) | nginx re-resolves its upstreams at runtime | 1 |
+| [DD-046](#dd-046) | §13.2's hold reaper: one lease per sweep, discovery by SCAN, a copied loop held by T-7 | 1 |
+| [DD-047](#dd-047) | Kafka's healthcheck gets its own small JVM, and runs every 30 s once healthy | 1 |
+| [DD-048](#dd-048) | A run during which the host was paging is invalid | 1 |
+| [DD-049](#dd-049) | The checkpoint interval is time-only, and replay does not yet consult it | 2 |
+| [DD-050](#dd-050) | Kafka's own rebalance is the replay buffer; nothing else queues | 2 |
+| [DD-051](#dd-051) | Reply delivery is broadcast-and-correlate, not partition-routed | 2 |
+| [DD-052](#dd-052) | Partition generation is a wall-clock millisecond, not a Postgres sequence | 2 |
+| [DD-053](#dd-053) | The dedup cache's retention window is sized to the retry window | 2 |
 
 ---
 
@@ -3180,6 +3196,361 @@ the load generator and this rule should fire far less — it should still run. T
 falsifiable form: **if a run with host page-ins p90 below 100/s still shows replica
 GC pauses above 1 s**, the pauses are not the pagefile, and this entry has
 misattributed them.
+
+---
+
+<a id="dd-049"></a>
+### DD-049 — The checkpoint interval is time-only, and replay does not yet consult it
+
+Date: 2026-09-18 · Author: Phase 2a · Phase: 2 · Requirements: §9.3, NFR-8, NFR-15, AC-2.2, AC-2.7
+Supersedes: —
+
+**Context.**
+
+[DD-013](#dd-013) decided checkpointing should fire "every 5 s or 10,000 events," async,
+guarded by generation, and split NFR-8 into a cold-start budget (100k events, ≤10 s)
+and a warm-rebalance budget (≤2 s from a valid checkpoint).
+
+The shipped code (`KafkaSeatAllocator.maybeCheckpoint`) implements only the time
+half of that trigger: a per-pool `lastCheckpointAt` debounce against
+`CHECKPOINT_INTERVAL = Duration.ofSeconds(5)`. There is no event-count trigger
+anywhere in the class.
+
+More importantly, `replayPartition` — the method that rebuilds a partition owner's
+masks after a crash or rebalance — always calls `seekToBeginning()` on the events
+topic and replays every event up to the current end offset. It never loads or
+consults the checkpoint that `maybeCheckpoint` just wrote for this partition's
+pools. This is not an oversight discovered after the fact; the class's own Javadoc
+states it as a deliberate scope cut: many pools hash onto one Kafka partition
+(§9.3), the `checkpoints` table is keyed per **pool**, and nothing yet records
+*which pools live on which partition* — so a newly-assigned owner has no list of
+checkpoints it could even look up before it has replayed anything and discovered
+its pools from `Provisioned` events. Building that directory is separate scope
+from checkpointing itself.
+
+Net effect: the checkpoint is written correctly and safely (fenced by generation,
+per DD-013 item 2), but as measured today, recovery always pays a full
+replay-from-zero regardless of how fresh the checkpoint is. The interval exists;
+it doesn't yet bound anything.
+
+**Decision.**
+
+Ship the time-only trigger as sufficient for this milestone, and state explicitly,
+here and in the class Javadoc, that **NFR-8's warm 2 s bound is not measured or
+claimed until a pool→partition directory exists to make checkpoint-aware replay
+possible.** DD-013 read alone, without this entry, overstates what the current
+code delivers.
+
+**Alternatives considered.**
+
+1. **Rejected — implement the 10,000-event trigger now anyway.** A trigger nothing
+   consumes doesn't change recovery time. It would add checkpoint-write volume and
+   a second constant to reason about while leaving the actual bottleneck
+   (replay-from-zero) untouched.
+2. **Rejected — build the pool→partition directory now to unblock this.** It is a
+   new piece of durable state with its own consistency question (who writes it,
+   when is it revised on rebalance), the class Javadoc scopes it out on purpose,
+   and folding it into "checkpoint interval" would misrepresent the size of what
+   was actually decided and shipped here.
+3. **Rejected — have replay opportunistically trust whatever checkpoint row exists
+   per pool, without a directory.** A newly-assigned owner doesn't yet know which
+   of the partition's pools it has until it has replayed and discovered them from
+   `Provisioned` events. Trusting a row it stumbles onto mid-replay would silently
+   shortcut some pools and silently do nothing for others — less honest than a
+   uniform full replay, not more.
+
+**Consequences.**
+
+Every rebalance for a partition — spurious or real — pays a full events-topic
+replay, compounding [DD-007](#dd-007)'s "every revocation destroys in-memory masks"
+cost. Not yet measured — record `partition_replay_duration_seconds` under P3 and
+chaos scenario C1, and expect it to scale with total `booking-events` volume for
+the partition, not with time-since-checkpoint. NFR-8 (warm 2 s, cold 10 s) and
+NFR-15, both restated at AC-2.2, are not yet claimed by this milestone. This also
+resolves, for now, [the amendment raised against DD-013](#dd-013): the checkpoint
+does not go stale under load in a way that matters yet, because nothing reads it
+back regardless of freshness.
+
+**What would change this.**
+
+Once a pool→partition directory exists and `replayPartition` seeks from the loaded
+checkpoint's offset instead of 0, re-measure `partition_replay_duration_seconds`
+under warm rebalance (C1) and a 100k-event cold start. If either budget still
+breaches after that change, revisit the trigger — add the event-count half back —
+before considering anything structural.
+
+---
+
+<a id="dd-050"></a>
+### DD-050 — Kafka's own rebalance is the replay buffer; nothing else queues
+
+Date: 2026-09-18 · Author: Phase 2a · Phase: 2 · Requirements: §9.3, NFR-8, AC-2.7
+Supersedes: —
+
+**Context.**
+
+§9.3 states that "commands received during replay are buffered, not rejected,"
+which reads as a requirement to build somewhere to hold them: an in-memory queue
+that accepts commands for a partition while its new owner is mid-replay, drained
+once replay finishes.
+
+No such queue exists anywhere in `adapters/allocator-swp`. The actual mechanism is
+structural, not something this code built: `commandLoop()` only calls
+`commandConsumer.poll()` on the `partition-owners` consumer group and dispatches
+whatever comes back. Kafka's own group-rebalance protocol blocks that consumer's
+`poll()` for a reassigned partition until `ConsumerRebalanceListener
+.onPartitionsAssigned()` returns — and `onPartitionsAssigned` calls
+`replayPartition()` synchronously before returning. So no command for that
+partition is ever delivered to this JVM, consumed or otherwise, until replay
+finishes. There is nothing to actively buffer, because nothing is consumed.
+
+**Decision.**
+
+Rely on Kafka's group-rebalance protocol as the buffer. Build no explicit queue.
+
+**Alternatives considered.**
+
+1. **Rejected — an explicit bounded in-memory queue for commands arriving during
+   replay.** It adds a new piece of state with its own failure modes — unbounded
+   growth if replay is slow, what happens to a non-empty queue if the JVM dies —
+   to solve a problem Kafka's group protocol already solves for free: a
+   reassigned partition's records are withheld from every consumer in the group
+   until reassignment completes.
+2. **Rejected — keep serving the old in-memory masks during replay instead of
+   withholding delivery.** [DD-007](#dd-007) already forecloses this: a revoked
+   owner discards its masks entirely, precisely because serving from them during
+   the window before replay finishes is the corrupt-state risk DD-007 exists to
+   prevent.
+
+**Consequences.**
+
+The "buffer" is really consumer lag: commands accumulate unconsumed on
+`booking-commands` for the reassigned partition for exactly as long as replay
+takes — which, per [DD-049](#dd-049), is currently a full topic replay, not
+bounded by a checkpoint. A rebalance storm during a spike shows up as growing lag
+on the `partition-owners` group, not as an application-level queue-depth metric;
+anyone diagnosing a stall here needs to look at Kafka, not JVM state. Not yet
+measured — record max consumer lag on that group under C1 (owner kill at spike
+peak) and confirm it returns to zero within the replay window.
+
+**What would change this.**
+
+If a chaos run shows client-side retries (the `RETRY_LATER` path) exhausting
+before replay completes, the fix is shortening replay — DD-049's checkpoint-aware
+seek — not adding a buffer; Kafka already buffers for free and was never the
+bottleneck. Only if lag itself starts causing consumer-group session timeouts (a
+distinct failure mode) would rebalance behavior need revisiting.
+
+---
+
+<a id="dd-051"></a>
+### DD-051 — Reply delivery is broadcast-and-correlate, not partition-routed; `replyPartition` is reserved, not live
+
+Date: 2026-09-18 · Author: Phase 2a · Phase: 2 · Requirements: §9.3, AC-2.7
+Supersedes: —
+
+**Context.**
+
+`PartitionCommand` carries a `replyPartition` field because §9.3's pseudocode
+requires it: any replica may issue a command that a *different* replica's
+partition owner ends up processing, so something has to get the reply back to
+whichever replica actually asked. The field's name suggests the replies topic is
+partitioned per replica or per request, and a reply is routed to "its" partition.
+
+That is not how it works as shipped. `KafkaSeatAllocator` defines
+`REPLY_PARTITION = 0` as a constant, and every command constructor — `provision`,
+`allocate`, `release`, `releaseConfirmed`, `confirm`, `availability`,
+`reapExpired` — passes that same constant. `replyPartition` is never varied at
+runtime; every reply is published to partition 0 of `booking-replies`, full stop.
+
+What actually gets a reply back to the right replica is a separate mechanism.
+Each replica's reply consumer joins its **own** randomly-generated consumer group
+(`"reply-consumer-" + UUID.randomUUID()`) and subscribes to the **entire** replies
+topic. Because each replica is the sole member of its own group, Kafka assigns it
+every partition of that topic — every replica reads every reply, regardless of
+which replica or partition produced it. `replyLoop()` then correlates purely by
+`commandId`: if this replica holds a pending future for that id, it completes;
+otherwise the reply is counted via `orphaned_replies_total` and dropped.
+
+**Decision.**
+
+Keep `replyPartition` as a field reserved for a partition-aware routing scheme
+that isn't built yet, and rely on full broadcast plus local `commandId`
+correlation as the actual mechanism for this milestone.
+
+**Alternatives considered.**
+
+1. **Rejected for this milestone — partition the replies topic by replica id, and
+   set `replyPartition` to the requester's own partition.** It requires each
+   replica to have a stable, known partition assignment — effectively a replica
+   registry — and requires the replies topic's partition count to track the
+   replica count. That is more moving state than the problem needs when a unique
+   consumer group per replica already gets every reply to everyone for free.
+2. **Rejected — partition the replies topic by a hash of `commandId` instead.** It
+   doesn't help: the requesting replica still has no way to know which partition
+   a given `commandId` hashed to without either recomputing the same hash or
+   being told, and a consumer group only lets a member consume its *assigned*
+   partitions, not "this one key regardless of partition." This alternative still
+   needs either full-topic broadcast subscription (making the partitioning
+   pointless) or a lookup service (new state, no correctness gain over `commandId`
+   correlation alone).
+
+**Consequences.**
+
+Reply-topic read cost scales with replica count × total reply volume: every
+replica reads every reply, and discards nearly all of them. `orphaned_replies_total`
+(§9.3) is not a rare failure signal here — it is the expected steady state for
+almost every reply at every replica except the one that asked. The existing
+inline comment framing it as "the normal case once a different replica than the
+one that asked has died" understates this: it is the normal case for nearly every
+reply, dead replica or not. Not yet measured — record reply-consumer CPU and lag
+per replica under P3 at the current two-replica topology (§8.3); that number is
+what would make alternative 1's added state worth paying for.
+
+**What would change this.**
+
+If reply-consumer CPU or lag becomes material as replica count grows past two,
+build the replica registry alternative 1 rejected here, and only then give
+`replyPartition` a real, varying value instead of the constant `0`.
+
+---
+
+<a id="dd-052"></a>
+### DD-052 — Partition generation is the assigning JVM's wall-clock millisecond, not a Postgres sequence
+
+Date: 2026-09-18 · Author: Phase 2a · Phase: 2 · Requirements: §9.3, AC-2.4, AC-2.7
+Supersedes: —
+
+**Context.**
+
+[DD-006](#dd-006) and [DD-013](#dd-013) decided a zombie partition owner must be
+fenced from both Kafka (producer epoch, DD-006) and Postgres (a generation guard
+on the `checkpoints` table, DD-013), because a Kafka-level fence has no authority
+over a separate Postgres write. Neither entry fixes *how* the generation number
+itself is generated — both describe it only as a number that increases with each
+new owner.
+
+As shipped, `generationByPartition` sets each partition's generation to
+`System.currentTimeMillis()` at the moment this JVM is assigned that partition.
+The field's own Javadoc states the reasoning plainly: a Postgres-issued sequence
+would be immune to clock skew across machines, but bootstrapping one requires
+the same pool→partition directory [DD-049](#dd-049) already deferred as separate
+scope, so this milestone accepts wall-clock time instead, with a named risk —
+if replica A's clock reads ahead of replica B's, a genuinely later owner (B) can
+be assigned a numerically *smaller* generation than an earlier zombie (A) had.
+`JdbcCheckpointStore.save()`'s guard — `WHERE checkpoints.generation_id <=
+EXCLUDED.generation_id` — would then accept the zombie's stale checkpoint over
+the real owner's: the exact corruption DD-013 was written to prevent, arriving by
+a route DD-013 didn't analyze.
+
+**Decision.**
+
+Accept wall-clock-millisecond generation for this milestone. Record the risk here
+explicitly rather than leaving it implicit in a single code comment.
+
+**Alternatives considered.**
+
+1. **Rejected for this milestone, not forever — issue generation numbers from a
+   Postgres sequence at assignment time.** Immune to clock skew, but it needs
+   either the pool→partition directory DD-049 already deferred, or a
+   Kafka-partition-keyed sequence table of its own. Building that here would
+   solve the same missing-directory problem twice, in two entries, for two
+   different reasons.
+2. **Rejected — derive generation from Kafka's own consumer-group generation
+   id**, available via the rebalance listener. Kafka's group generation
+   increments once per rebalance across *every* partition the group manages, not
+   per partition — two different partitions reassigned in the same rebalance
+   would share a generation number, which breaks the guard's assumption that
+   generation orders ownership of one specific partition.
+
+**Consequences.**
+
+The system carries an unquantified, real risk: a stale-generation checkpoint
+winning against a genuine one, specifically when cross-machine clock skew
+coincides with a rebalance. This project already treats clock behavior as a
+first-class testable condition — FR-31's injected offset, [DD-041](#dd-041) — but
+no chaos scenario in §19.2 (C1–C4) currently combines a rebalance with injected
+skew between replicas. This risk is therefore not merely unmeasured; it is
+currently unexercised by anything in the load and chaos plan.
+
+**What would change this.**
+
+Add a chaos overlay that skews one replica's clock forward relative to another's
+and then forces a rebalance between them — extending C1's "kill one replica" with
+a clock-skew precondition — and check whether `JdbcCheckpointStoreTest`'s
+`staleGenerationIsRejected` property (T-C10) still holds under real skew, not only
+under the test's own controlled generation values. If it fails, build alternative
+1's Postgres-sequence generation, bundled with DD-049's pool→partition directory.
+
+---
+
+<a id="dd-053"></a>
+### DD-053 — The dedup cache's retention window is sized to the retry window, not chosen independently of it
+
+Date: 2026-09-18 · Author: Phase 2a · Phase: 2 · Requirements: §9.3, AC-2.6, AC-2.7
+Supersedes: —
+
+**Context.**
+
+Extends [DD-009](#dd-009), which set the original dedup-identity and sizing
+rationale at design-review time, with the as-built numbers and eviction mechanics.
+
+`DedupCache` holds up to `DEDUP_MAX_ENTRIES = 5,000` replies for `DEDUP_TTL = 60 s`,
+one instance per currently-owned partition, rebuilt fresh on every
+`replayPartition`. It is backed by a `LinkedHashMap` in strict insertion order —
+not access order; a cache hit never moves an entry — with two independent
+eviction paths: time (`evictExpired`, checked on every `get()`, an exclusive TTL
+boundary) and size (`removeEldestEntry` once the map exceeds the cap, evicting the
+oldest-inserted entry regardless of remaining TTL). A size-eviction that removes an
+entry which had not yet expired increments `prematureEvictions` —
+`dedup_evictions_before_window_expiry_total` — the signal that the cache is
+undersized for the load it is actually seeing.
+
+**Decision.**
+
+Size the retention window (60 s) to "one in-flight command plus one retry," per
+DD-009, and treat the size cap (5,000 entries per partition) as the value to grow
+first if `dedup_evictions_before_window_expiry_total` is ever non-zero under real
+load. Never shrink the window below the client's retry timeout to save memory.
+
+**Alternatives considered.**
+
+1. **Rejected — make eviction access-order (true LRU) instead of insertion-order.**
+   A dedup entry exists to answer exactly one retry of the same `commandId`;
+   re-reading it doesn't make a *repeat* read more likely, unlike a general-purpose
+   cache, so access-order buys nothing here and adds bookkeeping (a `get()` that
+   must also mutate map order) to a class deliberately kept single-threaded and
+   simple.
+2. **Rejected for production — namespace dedup entries by pool**, the way Strategy
+   A's Redis keys already are. A real `commandId` (derived from the
+   `Idempotency-Key`) is globally unique across pools by construction, so
+   pool-namespacing would be dead weight on every lookup guarding against a
+   collision that cannot occur outside tests. (The contract test suite's own
+   literal ids like `"h"` *do* collide across independently-run test methods; the
+   fix used there is clearing the cache between tests, not changing production
+   identity or lowering `DEDUP_TTL` — see the class's own comment on
+   `clearDedupCachesForTesting()`.)
+3. **Rejected — size the cache purely by memory budget, independent of the retry
+   window.** DD-009 already establishes why the two are coupled: shrinking the
+   cache below the retry window reintroduces the double-allocation bug the dedup
+   cache exists to prevent, under exactly the load meant to prove it can't happen.
+   Treating retention and size as independent knobs invites tuning one without
+   noticing it breaks the other.
+
+**Consequences.**
+
+Correctness depends on `dedup_evictions_before_window_expiry_total` staying at
+zero under real load — the one metric this class exists to make observable rather
+than a size chosen once and never checked. Not yet measured under P1 or P3 at full
+replica count; that measurement is exactly what AC-2.6 requires ("zero under P1
+and P3") before Phase 2 can close.
+
+**What would change this.**
+
+If `dedup_evictions_before_window_expiry_total` is ever non-zero under P1 or P3,
+grow `DEDUP_MAX_ENTRIES` first — memory is cheap relative to a correctness bug. If
+that pushes stack memory against NFR-11's budget, shorten `DEDUP_TTL` only in
+coordination with the client's own retry timeout, never independently.
 
 ---
 
