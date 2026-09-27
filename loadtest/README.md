@@ -20,6 +20,7 @@ Maven phases couples unrelated builds and defeats Docker layer caching for both.
 | `profiles/p2-sustained-mixed.js` | §19.1 P2: `RATE` sustained, 90 % search / 10 % hold |
 | `profiles/p3-hot-partition.js` | §19.1 P3: P1's load, all of it onto one hot `(train, date, class)` pool — the strategy discriminator |
 | `run-profile.sh` | Driver: preflight → warm-up → reset → run → **drain** → §14 → §19.5 verdict |
+| `chaos/` | §19.2 C1–C4: each a wrapper around `run-profile.sh` that injects one fault at a timed point. See `chaos/README.md`. |
 | `results/` | Per-run JSON. Not committed. |
 | `targets.json` | Generated. Not committed — it describes one seeded database. |
 

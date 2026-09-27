@@ -1,0 +1,70 @@
+# Overlay for chaos scenario C3 (§19.2): routes the app's Postgres connection
+# through toxiproxy, and provisions the proxy the app needs before it can use
+# it.
+#
+# NOT part of the default stack, and not merged into compose.yaml. That file's
+# `toxiproxy` service already exists but is deliberately unused - its own
+# comment says "idle until Phase 2's chaos suite". Every number this repository
+# has published (AC-0.1, AC-0.7, AC-1.13, every committed benchmark under
+# docs/benchmarks/) was measured against the default datasource wiring
+# (`jdbc:postgresql://postgres:5432/tatkal`, direct). Changing that by default,
+# for the sake of the one scenario (C3) that needs a proxy in front of it,
+# would put an extra hop on every other run's write path and invalidate
+# numbers nothing here is trying to re-measure. This file adds the hop only
+# when explicitly asked for.
+#
+# Usage - start the stack WITH this file, then run C3:
+#
+#   TATKAL_CLOCK_OFFSET=P40D TATKAL_HOLD_TTL_MS=15000 \
+#     docker compose -f compose.yaml -f loadtest/chaos/compose.chaos.yaml up -d --wait
+#   ./loadtest/chaos/c3-postgres-freeze.sh
+#
+# C1, C2 and C4 do not need this file - they act on containers or on Redis
+# directly (docker kill/restart, redis-cli FLUSHALL), not on a network path
+# toxiproxy would sit in front of.
+services:
+
+  # One-shot: registers the "postgres" proxy with toxiproxy, then exits. Compose
+  # runs this whenever app-1/app-2 need it (service_completed_successfully) and
+  # will not start the apps until it has finished - see the depends_on entries
+  # below. Idempotent by `|| true`: `create` fails if the proxy already exists
+  # (e.g. this overlay was applied once, then `docker compose up` again without
+  # recreating toxiproxy's container), and treating "already there" as success
+  # is correct here - the goal is a proxy existing, not a fresh one.
+  toxiproxy-config:
+    image: ghcr.io/shopify/toxiproxy@sha256:77286c8debaadbc57c94c69e24cbff177a802d90986c3c88655280270863ae2b
+    mem_limit: 32m
+    depends_on:
+      toxiproxy: {condition: service_healthy}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >-
+        /toxiproxy-cli -h http://toxiproxy:8474
+        create postgres --listen 0.0.0.0:15432 --upstream postgres:5432 || true
+    restart: "no"
+
+  app-1:
+    environment:
+      # toxiproxy:15432, not postgres:5432 - see the file header. The proxy
+      # forwards transparently until c3-postgres-freeze.sh disables it.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://toxiproxy:15432/tatkal
+    depends_on:
+      toxiproxy-config: {condition: service_completed_successfully}
+
+  app-2:
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://toxiproxy:15432/tatkal
+    depends_on:
+      toxiproxy-config: {condition: service_completed_successfully}
+
+  # Not exercised by C3, but left off the direct path too for the same reason
+  # app-1/app-2 are: it runs the same image, and a datasource pointed at
+  # postgres directly while its siblings point at toxiproxy would make "the
+  # app talks to Postgres through toxiproxy" a claim that is true for two
+  # replicas out of three.
+  psp-sim:
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://toxiproxy:15432/tatkal
+    depends_on:
+      toxiproxy-config: {condition: service_completed_successfully}
