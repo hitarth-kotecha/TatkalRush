@@ -72,6 +72,21 @@ class DedupCacheTest {
     }
 
     @Test
+    @DisplayName("the eviction listener fires once per premature eviction, and not for an expired one")
+    void listenerFiresOnlyForPrematureEvictions() {
+        var fired = new int[] {0};
+        var cache = new DedupCache(2, Duration.ofSeconds(60), () -> fired[0]++);
+
+        cache.put("a", ack("a"), T0);
+        cache.put("b", ack("b"), T0.plusSeconds(120)); // "a" long expired
+        cache.put("c", ack("c"), T0.plusSeconds(120)); // evicts "a": expired, not premature
+        assertEquals(0, fired[0]);
+
+        cache.put("d", ack("d"), T0.plusSeconds(120)); // evicts "b": live, premature
+        assertEquals(1, fired[0]);
+    }
+
+    @Test
     @DisplayName("putWithExpiry (replay) honours an explicit expiry rather than now + ttl")
     void putWithExpiryHonoursExplicitExpiry() {
         var cache = new DedupCache(100, Duration.ofSeconds(60));

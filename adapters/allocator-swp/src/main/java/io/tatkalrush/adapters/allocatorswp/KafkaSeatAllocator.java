@@ -2,6 +2,8 @@ package io.tatkalrush.adapters.allocatorswp;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.FunctionCounter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.tatkalrush.application.ports.AllocationRequest;
 import io.tatkalrush.application.ports.AllocationResult;
@@ -148,6 +150,14 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
     private final CheckpointStore checkpointStore;
     private final MeterRegistry meters;
 
+    /**
+     * §9.3's {@code dedup_evictions_before_window_expiry_total}, cumulative across
+     * every cache this JVM has ever owned - not summed from the live caches,
+     * which are discarded on revocation (DD-007) and would take their counts
+     * with them. AC-2.6 requires it to be zero under P1 and P3.
+     */
+    private final Counter dedupPrematureEvictions;
+
     private final ConcurrentHashMap<Integer, PartitionOwner> owners = new ConcurrentHashMap<>();
 
     /** One transactional producer per currently-owned partition; see the class Javadoc. */
@@ -226,6 +236,19 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
         this.checkpointStore = checkpointStore;
         this.holdRoutingStore = holdRoutingStore;
         this.meters = meters;
+        this.dedupPrematureEvictions =
+                Counter.builder("dedup_evictions_before_window_expiry_total")
+                        .description(
+                                "§9.3/AC-2.6: dedup entries evicted for size before their TTL."
+                                        + " Any non-zero value under P1 or P3 means the cache is"
+                                        + " undersized (DD-009).")
+                        .register(meters);
+        FunctionCounter.builder("orphaned_replies_total", orphanedRepliesTotal, java.util.concurrent.atomic.AtomicLong::get)
+                .description(
+                        "§9.3: replies this replica read that it was not waiting for."
+                                + " Expected to be high with more than one replica - every"
+                                + " replica reads every reply (DD-051).")
+                .register(meters);
         this.json = new ObjectMapper().registerModule(new JavaTimeModule());
         // Deliberately no I/O here — see start().
     }
@@ -377,7 +400,7 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
 
     private ReplayResult replayPartitionTimed(int partition) {
         var owner = new PartitionOwner();
-        var dedup = new DedupCache(DEDUP_MAX_ENTRIES, DEDUP_TTL);
+        var dedup = new DedupCache(DEDUP_MAX_ENTRIES, DEDUP_TTL, dedupPrematureEvictions::increment);
         var tp = new TopicPartition(eventsTopic, partition);
 
         var props = new Properties();
@@ -958,19 +981,12 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
     }
 
     /**
-     * §9.3's {@code dedup_evictions_before_window_expiry_total}, summed across
-     * this instance's currently-owned partitions. Not yet wired to Micrometer —
-     * this allocator has no composition-root bean to register a meter with
-     * until the multi-instance milestone wires {@code tatkal.allocator.strategy}
-     * (see the M1 wrap-up); a plain counter is what an observer has to ask for
-     * in the meantime.
+     * §9.3's {@code dedup_evictions_before_window_expiry_total}: the same
+     * cumulative Micrometer counter {@code /actuator/prometheus} exposes, across
+     * every cache this instance has owned, including ones since revoked.
      */
     public long dedupPrematureEvictionsTotal() {
-        long total = 0;
-        for (DedupCache cache : dedupCaches.values()) {
-            total += cache.prematureEvictions();
-        }
-        return total;
+        return (long) dedupPrematureEvictions.count();
     }
 
     /**

@@ -75,10 +75,12 @@ violation during a chaos run means an allocator bug shipped, chaos or not.
 
 ## What these scripts cannot check yet, stated rather than hidden (NFR-14)
 
-- **`dedup_evictions_before_window_expiry_total` (AC-2.6).**
-  `KafkaSeatAllocator`/`DedupCache` track this as a plain in-JVM counter; it is
-  not wired to a `MeterRegistry`, so `/actuator/prometheus` does not expose it
-  and no script here can read it from outside the process.
+- **`dedup_evictions_before_window_expiry_total` (AC-2.6) is exposed, not
+  asserted.** It is a cumulative Micrometer counter on `/actuator/prometheus`
+  (also `orphaned_replies_total`), exported at zero from startup and surviving
+  partition revocation. Nothing here reads it automatically yet: after a
+  Strategy B run, scrape each replica and confirm it is `0`. A non-zero value
+  means the dedup cache is undersized ([DD-053](../../docs/design-decisions.md#dd-053)).
 - **NFR-8's ≤2 s warm-recovery bound (C1, C4) is measured, not met.**
   `partition_replay_duration_seconds` (tagged by partition) is now recorded
   around every `replayPartition()` call, regardless of outcome - the number

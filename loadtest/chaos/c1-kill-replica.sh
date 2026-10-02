@@ -20,10 +20,10 @@
 #
 # WHAT THIS SCRIPT CANNOT CHECK, AND WHY - stated here rather than silently
 # skipped (NFR-14):
-#   - dedup_evictions_before_window_expiry_total == 0 (AC-2.6). KafkaSeatAllocator
-#     tracks this as a plain in-JVM counter (DedupCache.prematureEvictions);
-#     nothing wires it to a MeterRegistry, so /actuator/prometheus does not
-#     expose it. There is nothing outside the JVM to read it from yet.
+#   - dedup_evictions_before_window_expiry_total == 0 (AC-2.6). It is exposed on
+#     /actuator/prometheus as a cumulative counter that survives partition
+#     revocation, but nothing here scrapes and asserts it; that is a manual
+#     check after a Strategy B run, on each replica.
 #   - NFR-8's <=2s bound, precisely. partition_replay_duration_seconds now
 #     exists (a Timer around every replayPartition() call, tagged by
 #     partition) and is scraped via /actuator/prometheus like any other
@@ -73,7 +73,8 @@ STATUS=$?
 
 echo
 echo "C1's own reminders (not checked above - see this file's header):"
-echo "  - dedup_evictions_before_window_expiry_total is not exposed via Prometheus yet"
+echo "  - dedup_evictions_before_window_expiry_total is exposed but not asserted here:"
+echo "    scrape /actuator/prometheus on both replicas after a Strategy B run - must be 0"
 echo "  - partition_replay_duration_seconds IS exposed now (query /actuator/prometheus"
 echo "    on whichever replica survived) - but per DD-049, expect it to exceed NFR-8's"
 echo "    2s budget: replay still starts from offset 0, not from a checkpoint"
