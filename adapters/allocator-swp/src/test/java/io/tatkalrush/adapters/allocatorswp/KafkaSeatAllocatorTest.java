@@ -1,5 +1,6 @@
 package io.tatkalrush.adapters.allocatorswp;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.tatkalrush.application.ports.SeatAllocator;
 import io.tatkalrush.application.ports.SeatAllocatorContract;
 import io.tatkalrush.domain.inventory.PoolKey;
@@ -78,7 +79,8 @@ class KafkaSeatAllocatorTest extends SeatAllocatorContract {
                         "booking-replies",
                         Duration.ofSeconds(30),
                         new InMemoryCheckpointStore(),
-                        new InMemoryHoldRoutingStore());
+                        new InMemoryHoldRoutingStore(),
+                        new SimpleMeterRegistry());
         allocator.start();
     }
 

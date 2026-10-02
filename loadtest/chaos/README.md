@@ -79,11 +79,14 @@ violation during a chaos run means an allocator bug shipped, chaos or not.
   `KafkaSeatAllocator`/`DedupCache` track this as a plain in-JVM counter; it is
   not wired to a `MeterRegistry`, so `/actuator/prometheus` does not expose it
   and no script here can read it from outside the process.
-- **NFR-8's ≤2 s warm-recovery bound (C1, C4).** [DD-049](../../docs/design-decisions.md#dd-049)
-  found that partition replay always starts from offset 0, never from the
-  checkpoint it just wrote, so there is no recovery-duration metric to assert
-  against yet. `RETRY_LATER`'s count and where it falls in the run is the
-  closest available signal, and it is reported, not asserted on.
+- **NFR-8's ≤2 s warm-recovery bound (C1, C4) is measured, not met.**
+  `partition_replay_duration_seconds` (tagged by partition) is now recorded
+  around every `replayPartition()` call, regardless of outcome - the number
+  exists. It is expected to exceed the budget anyway: [DD-049](../../docs/design-decisions.md#dd-049)
+  found that replay always starts from offset 0, never from the checkpoint it
+  just wrote, and wiring the metric does not change that. `RETRY_LATER`'s count
+  and where it falls in the run remains a useful secondary signal, but the
+  Timer is the number to read first.
 - **A per-second timeline for C2/C3's fault window.** The result JSON is a
   single post-run summary. Confirming that failures/`RETRY_LATER` cluster
   inside the injection window rather than spreading across the whole run is,

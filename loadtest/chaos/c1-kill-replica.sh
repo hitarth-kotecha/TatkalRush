@@ -24,13 +24,15 @@
 #     tracks this as a plain in-JVM counter (DedupCache.prematureEvictions);
 #     nothing wires it to a MeterRegistry, so /actuator/prometheus does not
 #     expose it. There is nothing outside the JVM to read it from yet.
-#   - NFR-8's <=2s bound, precisely. DD-049 found replayPartition() always
-#     replays the events topic from offset 0, never from the checkpoint it
-#     just wrote, so there is no recovery-duration metric to assert against
-#     either. RETRY_LATER's count (lib/api.js) is the closest available proxy:
-#     it should stop shortly after the kill under Strategy B, and near-zero
-#     throughout under Strategy A. "Shortly" is left for a human to read off
-#     the result JSON, not a number this script asserts.
+#   - NFR-8's <=2s bound, precisely. partition_replay_duration_seconds now
+#     exists (a Timer around every replayPartition() call, tagged by
+#     partition) and is scraped via /actuator/prometheus like any other
+#     metric - but DD-049 found replay always starts from offset 0, never from
+#     the checkpoint it just wrote, and wiring the metric does not change that.
+#     Expect the number to exceed the budget; this script reports it, it does
+#     not assert against it. RETRY_LATER's count (lib/api.js) is a secondary
+#     signal: it should stop shortly after the kill under Strategy B, and
+#     near-zero throughout under Strategy A.
 #
 # Usage:
 #   ./loadtest/chaos/c1-kill-replica.sh [base-url]
@@ -72,8 +74,8 @@ STATUS=$?
 echo
 echo "C1's own reminders (not checked above - see this file's header):"
 echo "  - dedup_evictions_before_window_expiry_total is not exposed via Prometheus yet"
-echo "  - NFR-8's <=2s recovery bound is not measured; RETRY_LATER's count and its"
-echo "    position in the run (should cluster right after the kill) is the closest"
-echo "    available signal"
+echo "  - partition_replay_duration_seconds IS exposed now (query /actuator/prometheus"
+echo "    on whichever replica survived) - but per DD-049, expect it to exceed NFR-8's"
+echo "    2s budget: replay still starts from offset 0, not from a checkpoint"
 
 exit $STATUS

@@ -2,6 +2,7 @@ package io.tatkalrush.adapters.allocatorswp;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.tatkalrush.application.ports.AllocationRequest;
 import io.tatkalrush.application.ports.AllocationResult;
 import io.tatkalrush.application.ports.AvailabilitySnapshot;
@@ -112,7 +113,11 @@ import org.springframework.context.SmartLifecycle;
  * replayed anything and discovered its pools from {@code Provisioned} events.
  * Solving that means adding a directory, which is separate scope. Recovery here
  * is therefore <b>correct but not yet bounded</b> — NFR-8's ≤2 s warm-recovery
- * target is not measured or claimed by this milestone.
+ * target is not claimed by this milestone. It is, however, now <em>measured</em>:
+ * {@link #replayPartition} records {@code partition_replay_duration_seconds}
+ * (DD-049) regardless of outcome, so AC-2.2's chaos runs (C1, C4) have a real
+ * number to read even though this milestone expects it to exceed the budget -
+ * every replay still starts from offset 0, not from a checkpoint.
  */
 public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, SmartLifecycle {
 
@@ -141,6 +146,7 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
     private final Duration replyTimeout;
     private final ObjectMapper json;
     private final CheckpointStore checkpointStore;
+    private final MeterRegistry meters;
 
     private final ConcurrentHashMap<Integer, PartitionOwner> owners = new ConcurrentHashMap<>();
 
@@ -210,7 +216,8 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
             String repliesTopic,
             Duration replyTimeout,
             CheckpointStore checkpointStore,
-            HoldRoutingStore holdRoutingStore) {
+            HoldRoutingStore holdRoutingStore,
+            MeterRegistry meters) {
         this.bootstrapServers = bootstrapServers;
         this.commandsTopic = commandsTopic;
         this.eventsTopic = eventsTopic;
@@ -218,6 +225,7 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
         this.replyTimeout = replyTimeout;
         this.checkpointStore = checkpointStore;
         this.holdRoutingStore = holdRoutingStore;
+        this.meters = meters;
         this.json = new ObjectMapper().registerModule(new JavaTimeModule());
         // Deliberately no I/O here — see start().
     }
@@ -351,8 +359,23 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
      * <p>Uses a manually-assigned consumer, not the consumer group: replay needs
      * to seek to an exact offset and stop at an exact one, which a group
      * membership's rebalance-driven assignment does not give control over.
+     *
+     * <p>Timed end to end, regardless of outcome (DD-049): {@code
+     * partition_replay_duration_seconds}, tagged by partition, is AC-2.2's and
+     * NFR-8/NFR-15's only observable recovery-time signal today. It is not a
+     * claim that the budget is met - see the class Javadoc.
      */
     private ReplayResult replayPartition(int partition) {
+        long startNanos = System.nanoTime();
+        try {
+            return replayPartitionTimed(partition);
+        } finally {
+            meters.timer("partition_replay_duration_seconds", "partition", String.valueOf(partition))
+                    .record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+        }
+    }
+
+    private ReplayResult replayPartitionTimed(int partition) {
         var owner = new PartitionOwner();
         var dedup = new DedupCache(DEDUP_MAX_ENTRIES, DEDUP_TTL);
         var tp = new TopicPartition(eventsTopic, partition);
