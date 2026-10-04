@@ -33,8 +33,9 @@
 #                        the REAL run only (never the discarded warm-up)
 #   CHAOS_DELAY_SECONDS  seconds to wait after the real k6 run starts before
 #                        running CHAOS_CMD
-#   CHAOS_SCENARIO       C1/C2/C3/C4 - when set, this run's request_failures are
-#                        REPORTED rather than treated as a §19.5 defect. A chaos
+#   CHAOS_SCENARIO       C1/C2/C3/C4 - when set, this run's request_failures and
+#                        dropped iterations are REPORTED rather than treated as a
+#                        §19.5 defect. A chaos
 #                        injection is expected to fail requests on purpose; the
 #                        three checks §19.5 actually names (rate_limited,
 #                        allocation_constraint_violations_total, §14 invariants)
@@ -353,9 +354,18 @@ if not invariants_ok:
 # Not in §19.5, but the same class of defect one layer down: a step that dropped
 # iterations measured the load generator.
 if d.get("dropped_iterations", 0) > 0:
-    reasons.append(
-        "k6 dropped %d iterations - the load generator was the bottleneck, so this "
-        "run measures the harness" % d["dropped_iterations"])
+    if chaos_scenario:
+        # A stalled backend blocks every VU on a slow response, and k6 drops the
+        # arrivals it has no free VU for. That is what a fault looks like from
+        # the load generator, not a harness bottleneck - the same reason failures
+        # are only reported here. Reported, never silently dropped (NFR-14).
+        print(" NOTE: k6 dropped %d iterations during chaos scenario %s - expected "
+              "when the backend stalls; they should cluster inside the injection "
+              "window." % (d["dropped_iterations"], chaos_scenario))
+    else:
+        reasons.append(
+            "k6 dropped %d iterations - the load generator was the bottleneck, so this "
+            "run measures the harness" % d["dropped_iterations"])
 if d.get("failures", 0) > 0:
     if chaos_scenario:
         # §19.2's whole point: a chaos scenario deliberately breaks something,
@@ -396,8 +406,15 @@ if reasons:
         print("   - %s" % r)
     sys.exit(1)
 
-print(" RUN IS VALID (§19.5): no RATE_LIMITED, no constraint violations,")
-print(" every §14 invariant passed, no dropped iterations, no failures.")
+if chaos_scenario:
+    # Said plainly, because the unconditional line below claimed "no failures" over
+    # a C3 run that had 837 of them.
+    print(" RUN IS VALID (§19.5) as a chaos run: no RATE_LIMITED, no constraint")
+    print(" violations, every §14 invariant passed. Failures and dropped iterations")
+    print(" were expected here and are reported above, not excused by this line.")
+else:
+    print(" RUN IS VALID (§19.5): no RATE_LIMITED, no constraint violations,")
+    print(" every §14 invariant passed, no dropped iterations, no failures.")
 ENDPY
 VERDICT=$?
 echo "================================================================"

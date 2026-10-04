@@ -49,6 +49,10 @@ for jar in ops/pool-warmup/target/pool-warmup.jar; do
   [ -f "$ROOT/$jar" ] || { echo "$jar missing. Run: mvn -o package -DskipTests" >&2; exit 1; }
 done
 
+# A stalled backend releases every blocked VU at once, so users bunch up and a few
+# briefly exceed FR-20's 3 holds. More users (not a looser rule) keeps
+# TOO_MANY_HOLDS meaningful: it is still a validity failure here.
+export USER_HEADROOM="${USER_HEADROOM:-3}"
 export RATE DURATION_MINUTES
 export CHAOS_SCENARIO="C2"
 export CHAOS_DELAY_SECONDS="$FLUSH_AT_SECONDS"

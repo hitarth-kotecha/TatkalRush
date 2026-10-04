@@ -10,7 +10,7 @@ wait, and the result JSON — the only new thing each script adds is *when* and
 |---|---|---|---|
 | [`c1-kill-replica.sh`](c1-kill-replica.sh) | `docker compose kill` one app replica | P1 | Strategy B rebalances onto the survivor; Strategy A: near-zero impact |
 | [`c2-redis-flushall.sh`](c2-redis-flushall.sh) | `redis-cli FLUSHALL`, then the explicit rebuild (DD-040) | P2 | in-flight holds lost, confirmed bookings intact, masks + free counts rebuilt |
-| [`c3-postgres-freeze.sh`](c3-postgres-freeze.sh) | toxiproxy disables the Postgres proxy for 5 s | P2 | writes 503, reads keep serving from Redis, recovery on release |
+| [`c3-postgres-freeze.sh`](c3-postgres-freeze.sh) | toxiproxy disables the Postgres proxy for 5 s | P2 | §19.2 says writes 503 and reads keep serving. **Not what happens:** both return a raw 500 after 3 s (finding 4 in [002](../../docs/benchmarks/002-chaos-strategy-a.md)). Invariants hold and traffic recovers on release |
 | [`c4-kafka-restart.sh`](c4-kafka-restart.sh) | `docker compose restart kafka` | P1 | Strategy B buffers/retries, no double-apply; Strategy A: non-event |
 
 ## Running one
@@ -31,10 +31,15 @@ TATKAL_CLOCK_OFFSET=P40D TATKAL_HOLD_TTL_MS=15000 \
 ```
 
 AC-2.3 and AC-2.6 both want every scenario run against **both** allocator
-strategies. Restart the stack with `TATKAL_ALLOCATOR_STRATEGY=single-writer`
-between runs (default is `redis-lua`) — `run-profile.sh` reads it from the
-running container and stamps `allocator_strategy` into every result JSON, so
-the two runs stay distinguishable without hand-tracking which was which.
+strategies. **Only Strategy A (the default) can be run today.** `compose.yaml` does
+not pass `TATKAL_ALLOCATOR_STRATEGY` through to the apps, so exporting it before
+`docker compose up` changes nothing; the Kafka listener advertises `kafka:9092`,
+which the host-side `SwpPoolWarmupMain` cannot resolve; and `run-profile.sh`'s reset
+and INV-5/8/12 are Redis-only, so under Strategy B the invariant stage would pass
+vacuously. See [`docs/benchmarks/002-chaos-strategy-a.md`](../../docs/benchmarks/002-chaos-strategy-a.md).
+`run-profile.sh` does read the strategy from the running container and stamps
+`allocator_strategy` into every result JSON, so the two runs will stay
+distinguishable once Strategy B can be started.
 
 ## How injection is timed
 

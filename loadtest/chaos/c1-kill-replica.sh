@@ -11,12 +11,13 @@
 #   Both        zero lost confirmed bookings, zero allocation_constraint_violations_total
 #               (INV-1, INV-2 - checked below via run-profile.sh's own §14 pass).
 #
-# restart: unless-stopped (compose.yaml) brings the killed replica back on its
-# own during the run, which is deliberate: a real crash-and-recover, not a
-# permanent removal, is what C1 is testing. The survivor's takeover of the
-# dead replica's partitions is the event under test; the dead one rejoining
-# later and discarding its own state (DD-007) is a second, smaller version of
-# the same event, not a confound.
+# The killed replica is started again explicitly, DOWN_SECONDS later. It does NOT
+# come back on its own: compose.yaml's `restart: unless-stopped` does not apply
+# to `docker kill` (Docker records it as a manual stop; found live, the container
+# stayed Exited (137) for the rest of the run). A real crash-and-recover is what
+# C1 is testing: the survivor's takeover of the dead replica's partitions is the
+# event, and the dead one rejoining later and discarding its own state (DD-007)
+# is a second, smaller version of the same event, not a confound.
 #
 # WHAT THIS SCRIPT CANNOT CHECK, AND WHY - stated here rather than silently
 # skipped (NFR-14):
@@ -39,6 +40,7 @@
 # Env:
 #   KILL_TARGET   which replica dies (default: app-1). The other one survives
 #                 and, under Strategy B, takes over its partitions.
+#   DOWN_SECONDS  how long it stays dead before being started again (default 15).
 #   PEAK_RPS, RAMP_SECONDS, HOLD_SECONDS   same meaning as p1-tatkal-spike.js.
 set -uo pipefail
 
@@ -50,6 +52,7 @@ PEAK_RPS="${PEAK_RPS:-60}"
 RAMP_SECONDS="${RAMP_SECONDS:-10}"
 HOLD_SECONDS="${HOLD_SECONDS:-30}"
 KILL_TARGET="${KILL_TARGET:-app-1}"
+DOWN_SECONDS="${DOWN_SECONDS:-15}"
 
 # Lands mid-hold, not at the exact ramp-complete instant. k6's setup() (a token
 # fetch per VU, lib/api.js) runs before the ramp starts and takes longer at
@@ -62,9 +65,10 @@ KILL_AT_SECONDS="${KILL_AT_SECONDS:-$((RAMP_SECONDS + HOLD_SECONDS / 2))}"
 export PEAK_RPS RAMP_SECONDS HOLD_SECONDS
 export CHAOS_SCENARIO="C1"
 export CHAOS_DELAY_SECONDS="$KILL_AT_SECONDS"
-export CHAOS_CMD="docker compose --project-directory '$ROOT' -f '$ROOT/compose.yaml' kill '$KILL_TARGET'"
+DC="docker compose --project-directory '$ROOT' -f '$ROOT/compose.yaml'"
+export CHAOS_CMD="$DC kill '$KILL_TARGET' && sleep $DOWN_SECONDS && $DC start '$KILL_TARGET'"
 
-echo "C1: killing $KILL_TARGET ${KILL_AT_SECONDS}s into the real run (${RAMP_SECONDS}s ramp + half of ${HOLD_SECONDS}s hold)"
+echo "C1: killing $KILL_TARGET ${KILL_AT_SECONDS}s into the real run (${RAMP_SECONDS}s ramp + half of ${HOLD_SECONDS}s hold), restarting it ${DOWN_SECONDS}s later"
 echo
 
 "$HERE/../run-profile.sh" p1 "$BASE"

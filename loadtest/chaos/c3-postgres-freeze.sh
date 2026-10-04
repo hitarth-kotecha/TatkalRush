@@ -37,7 +37,14 @@ FREEZE_SECONDS="${FREEZE_SECONDS:-5}"
 RATE="${RATE:-200}"
 DURATION_MINUTES="${DURATION_MINUTES:-5}"
 
-DC="docker compose --project-directory '$ROOT' -f '$ROOT/compose.yaml'"
+# MSYS_NO_PATHCONV: under Git Bash on Windows, an argument that looks like a Unix
+# path ("/toxiproxy-cli") is rewritten to a Windows one before Docker sees it
+# ("C:/Program Files/Git/toxiproxy-cli"), and the exec fails. Found by running it.
+# Harmless everywhere else.
+# With conversion off, the project path must already be one Docker.exe understands:
+# `cygpath -m` gives E:/TatkalRush (and does not exist off Windows, where $ROOT is fine).
+ROOT_NATIVE="$(cygpath -m "$ROOT" 2>/dev/null || echo "$ROOT")"
+DC="MSYS_NO_PATHCONV=1 docker compose --project-directory '$ROOT_NATIVE' -f '$ROOT_NATIVE/compose.yaml'"
 
 # Preflight: without the overlay, "toggle postgres" fails against a proxy that
 # was never created, and the app is talking to Postgres directly regardless -
@@ -55,6 +62,10 @@ fi
 # c2-redis-flushall.sh for why this uses python rather than bash arithmetic.
 FREEZE_AT_SECONDS="$(python -c "print(int($DURATION_MINUTES * 60 / 2))")"
 
+# A stalled backend releases every blocked VU at once, so users bunch up and a few
+# briefly exceed FR-20's 3 holds. More users (not a looser rule) keeps
+# TOO_MANY_HOLDS meaningful: it is still a validity failure here.
+export USER_HEADROOM="${USER_HEADROOM:-3}"
 export RATE DURATION_MINUTES
 export CHAOS_SCENARIO="C3"
 export CHAOS_DELAY_SECONDS="$FREEZE_AT_SECONDS"

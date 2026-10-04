@@ -49,16 +49,44 @@ const HOLD_RATE = RATE * WRITE_FRACTION;
  * JavaScript runtimes than this box has memory for (AC-1.13 dropped iterations at
  * 1,334). DD-044 shortens the TTL for benchmark runs; the report declares it.
  *
- * With the same 1.5x headroom as P1, for the same reason: the inequality is a mean,
+ * With 1.5x headroom by default, as P1 (USER_HEADROOM overrides it - C2 and C3 raise it,
+ * because a stalled backend releases its blocked VUs in a burst), for the same reason: the inequality is a mean,
  * and a VU sized to sit exactly on FR-20's limit exceeds it whenever k6 hands it an
  * iteration slightly early.
  */
-const USER_HEADROOM = 1.5;
+const USER_HEADROOM = parseFloat(__ENV.USER_HEADROOM || '1.5');
+const WRITE_PERIOD = Math.round(1 / WRITE_FRACTION);
+
+function gcd(a, b) {
+  return b === 0 ? a : gcd(b, a % b);
+}
+
+/**
+ * The VU count must share no factor with the write period.
+ *
+ * Writes are every WRITE_PERIOD-th iteration, deliberately deterministic, and k6
+ * hands iterations to its VUs in strict rotation. If the VU count is a multiple
+ * of the period, iteration i always lands on VU (i mod VUs), so only VUs whose id
+ * is a multiple of the period EVER write: at 200 rps and 150 VUs, 15 users took
+ * every hold, hit FR-20's limit, and 75% of holds came back TOO_MANY_HOLDS - with
+ * no chaos at all, reproduced on a plain run. The default 550 rps gives 413 VUs,
+ * which is coprime with 10, so the defect never showed until another rate did.
+ */
+function coprimeWithWritePeriod(vus) {
+  let n = vus;
+  while (gcd(n, WRITE_PERIOD) !== 1) {
+    n += 1;
+  }
+  return n;
+}
+
 const VUS = Math.min(
-  Math.max(
-    50,
-    Math.ceil(((HOLD_RATE * HOLD_TTL_SECONDS) / 3) * USER_HEADROOM),
-    Math.ceil(RATE / 5),
+  coprimeWithWritePeriod(
+    Math.max(
+      50,
+      Math.ceil(((HOLD_RATE * HOLD_TTL_SECONDS) / 3) * USER_HEADROOM),
+      Math.ceil(RATE / 5),
+    ),
   ),
   USERS.count,
 );
