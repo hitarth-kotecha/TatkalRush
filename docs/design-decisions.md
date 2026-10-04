@@ -84,6 +84,7 @@ This is the running record of *why* TatkalRush is built the way it is. The SDD s
 | [DD-051](#dd-051) | Reply delivery is broadcast-and-correlate, not partition-routed | 2 |
 | [DD-052](#dd-052) | Partition generation is a wall-clock millisecond, not a Postgres sequence | 2 |
 | [DD-053](#dd-053) | The dedup cache's retention window is sized to the retry window | 2 |
+| [DD-054](#dd-054) | A checkpoint is "complete through partition offset N", and recovery trusts a partition's rows as its whole pool list | 2 |
 
 ---
 
@@ -3551,6 +3552,98 @@ If `dedup_evictions_before_window_expiry_total` is ever non-zero under P1 or P3,
 grow `DEDUP_MAX_ENTRIES` first — memory is cheap relative to a correctness bug. If
 that pushes stack memory against NFR-11's budget, shorten `DEDUP_TTL` only in
 coordination with the client's own retry timeout, never independently.
+
+---
+
+<a id="dd-054"></a>
+### DD-054 — A checkpoint is "complete through partition offset N", and recovery trusts a partition's rows as its whole pool list
+
+Date: 2026-10-02 · Author: Phase 2a · Phase: 2 · Requirements: §9.3, NFR-8, NFR-15, AC-2.2, AC-2.7
+Supersedes: [DD-049](#dd-049) (its scope cut: replay never consulted the checkpoint), and changes the meaning DD-013 gave `kafka_offset`
+
+**Context.**
+
+[DD-049](#dd-049) recorded that `replayPartition` always replayed from offset 0
+because a new owner had no way to know which pools live on its partition, so it
+could not know which checkpoints to load. Closing that gap looked like "add a
+pool-to-partition directory and start from the oldest checkpoint". That has a trap.
+
+A checkpoint's offset meant "the last event for **this pool**". A pool provisioned
+an hour ago and never booked has an hour-old offset. Recovery that starts from
+the oldest checkpoint in a partition therefore replays that hour, and it is
+bounded only in a partition where every pool is busy. With 3,600 pools over 12
+partitions, almost none are.
+
+**Decision.**
+
+1. **`checkpoints.kafka_offset` means "this snapshot is complete through this
+   offset of the partition's events topic", whichever pool those events were for.**
+   The owner applies events strictly in offset order on one thread, so a snapshot
+   taken at any moment already reflects everything up to the last event applied.
+2. **Idle pools stay current without being rewritten.** Every 5 s the owner
+   snapshots pools that have changed since their snapshot was last *confirmed*
+   written, and moves the offset of the rest forward in one batched `UPDATE` that
+   carries no payload. "Confirmed" is the point: `save` now reports whether the
+   generation guard let it through, and a refused write is never recorded as
+   persisted, or a later advance would vouch for a snapshot that never landed.
+3. **`kafka_partition` on the row (V11)** lets recovery load every pool of its
+   partition. The set is trusted as *complete* because provisioning writes a
+   presence marker (`kafka_offset = -1`) synchronously, before the `Provisioned`
+   event can commit.
+4. **Anything that breaks that trust falls back to a full replay**, which is always
+   correct: no rows, any marker, a snapshot in the old format or that will not
+   decode, an offset at or past the log's end, or Postgres unreachable.
+5. **Replay starts at the lower of two floors**: the oldest checkpoint plus one,
+   and the first event inside the 60 s dedup window (the dedup cache is rebuilt
+   from commands). Events before a pool's own checkpoint are decoded for dedup but
+   not applied to it. `Reaped` names no pool, so it is applied to every pool;
+   reaping is idempotent because a hold created after a reap expires after it.
+6. **Snapshots carry berth ids**, so a pool restores without its `Provisioned`
+   event. V11 discards existing rows: nothing ever read them.
+7. **An aborted batch rebuilds the owner from the log.** The heap was ahead of it
+   (DD-007's concern), and checkpointing that state would persist something that
+   never happened. This was latent before; it matters now that snapshots are read.
+
+**Alternatives considered.**
+
+1. **Rejected — rewrite every pool's snapshot every 5 s to keep offsets fresh.**
+   At 3,600 pools of about 11 KB that is roughly 8 MB/s of Postgres writes on a
+   512 MB container, to refresh bytes that did not change.
+2. **Rejected — one snapshot per partition instead of per pool.** About 300 pools
+   of ~11 KB is over 3 MB per write, on the owner's checkpoint path, to recover
+   one pool's worth of change.
+3. **Rejected — a separate `pool_directory` table.** It answers "which pools" but
+   not the stale-offset problem, and it is a second durable record that has to
+   agree with `checkpoints`. Putting the partition on the checkpoint row makes the
+   list and the state one write.
+4. **Rejected — recompute each pool's partition by re-implementing Kafka's
+   murmur2 hash.** The owner already knows its own partition, so storing it is
+   exact and a copy of a client-internal algorithm is not.
+
+**Consequences.**
+
+Recovery cost now scales with the last ~60 s of events plus one snapshot load per
+pool, instead of the whole topic. **Not yet measured**: read
+`partition_replay_duration_seconds` under C1 against NFR-8's 2 s and NFR-15's 10 s.
+A cold partition with no usable checkpoints still replays everything, by design.
+
+Costs: `provision` now does a synchronous Postgres write per pool inside the
+owner's batch (once per pool, at warm-up, off the hot path); a snapshot is about
+twice its old size; and the partition's idle pools cost one small `UPDATE` per
+tick.
+
+This does **not** resolve [DD-052](#dd-052). Generation is still the assigning
+JVM's wall-clock millisecond; a Postgres-issued generation is now *possible* (the
+partition is on the row) but not built.
+
+**What would change this.**
+
+If `partition_replay_duration_seconds` under C1 still breaches 2 s with checkpoints
+in use, the 60 s dedup floor is the first suspect: shrink the dedup window to what
+a client retry actually needs, or rebuild the cache lazily. If a recovery ever
+differs from a full replay's state, trust full replay and treat this entry as
+wrong; `CheckpointReplayTest` asserts they agree, and an INV-8-style comparison
+after a chaos run would catch it live.
 
 ---
 

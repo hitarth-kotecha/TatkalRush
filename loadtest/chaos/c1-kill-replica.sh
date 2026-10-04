@@ -24,15 +24,14 @@
 #     /actuator/prometheus as a cumulative counter that survives partition
 #     revocation, but nothing here scrapes and asserts it; that is a manual
 #     check after a Strategy B run, on each replica.
-#   - NFR-8's <=2s bound, precisely. partition_replay_duration_seconds now
-#     exists (a Timer around every replayPartition() call, tagged by
-#     partition) and is scraped via /actuator/prometheus like any other
-#     metric - but DD-049 found replay always starts from offset 0, never from
-#     the checkpoint it just wrote, and wiring the metric does not change that.
-#     Expect the number to exceed the budget; this script reports it, it does
-#     not assert against it. RETRY_LATER's count (lib/api.js) is a secondary
-#     signal: it should stop shortly after the kill under Strategy B, and
-#     near-zero throughout under Strategy A.
+#   - NFR-8's <=2s bound, precisely. partition_replay_duration_seconds is
+#     exposed (a Timer around every replayPartition() call, tagged by
+#     partition) and replay now starts from the partition's checkpoints,
+#     not offset 0 (DD-054). Read the Timer on the surviving replica after
+#     the run; this script reports it, it does not assert against it.
+#     RETRY_LATER's count (lib/api.js) is a secondary signal: it should stop
+#     shortly after the kill under Strategy B, and near-zero throughout
+#     under Strategy A.
 #
 # Usage:
 #   ./loadtest/chaos/c1-kill-replica.sh [base-url]
@@ -75,8 +74,8 @@ echo
 echo "C1's own reminders (not checked above - see this file's header):"
 echo "  - dedup_evictions_before_window_expiry_total is exposed but not asserted here:"
 echo "    scrape /actuator/prometheus on both replicas after a Strategy B run - must be 0"
-echo "  - partition_replay_duration_seconds IS exposed now (query /actuator/prometheus"
-echo "    on whichever replica survived) - but per DD-049, expect it to exceed NFR-8's"
-echo "    2s budget: replay still starts from offset 0, not from a checkpoint"
+echo "  - partition_replay_duration_seconds is exposed (query /actuator/prometheus on"
+echo "    whichever replica survived); compare it to NFR-8's 2s - replay starts from"
+echo "    checkpoints now (DD-054), so this is the number that says whether that worked"
 
 exit $STATUS

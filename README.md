@@ -192,6 +192,7 @@ and the head-to-head comparison are not built yet.**
 | Strategy B: round trip, fencing, WAL, checkpointing, replay, dedup, cross-replica routing, selectable via `tatkal.allocator.strategy` | ✅ built |
 | Strategy B pool provisioning (`ops/pool-warmup`'s `SwpPoolWarmupMain`) | ✅ built |
 | Chaos suite, C1–C4 (`loadtest/chaos/`) | 🔧 built, not yet run |
+| Checkpoint-bounded recovery for Strategy B ([DD-054](docs/design-decisions.md#dd-054)) | ✅ built, recovery time not yet measured live |
 | **§9.4 comparison report** | Phase 2 |
 | **RAC/WL, chart preparation** | Phase 3a |
 | **React dashboard** | Phase 3b |

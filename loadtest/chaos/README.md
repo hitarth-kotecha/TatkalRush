@@ -81,14 +81,14 @@ violation during a chaos run means an allocator bug shipped, chaos or not.
   partition revocation. Nothing here reads it automatically yet: after a
   Strategy B run, scrape each replica and confirm it is `0`. A non-zero value
   means the dedup cache is undersized ([DD-053](../../docs/design-decisions.md#dd-053)).
-- **NFR-8's ≤2 s warm-recovery bound (C1, C4) is measured, not met.**
-  `partition_replay_duration_seconds` (tagged by partition) is now recorded
-  around every `replayPartition()` call, regardless of outcome - the number
-  exists. It is expected to exceed the budget anyway: [DD-049](../../docs/design-decisions.md#dd-049)
-  found that replay always starts from offset 0, never from the checkpoint it
-  just wrote, and wiring the metric does not change that. `RETRY_LATER`'s count
-  and where it falls in the run remains a useful secondary signal, but the
-  Timer is the number to read first.
+- **NFR-8's ≤2 s warm-recovery bound (C1, C4) is measured, not asserted.**
+  `partition_replay_duration_seconds` (tagged by partition) is recorded around every
+  `replayPartition()` call, and replay now starts from the partition's checkpoints
+  rather than offset 0 ([DD-054](../../docs/design-decisions.md#dd-054), which
+  supersedes the gap [DD-049](../../docs/design-decisions.md#dd-049) recorded). Whether
+  that meets the budget is exactly what a Strategy B C1 run is for: read the Timer on
+  the surviving replica. `RETRY_LATER`'s count and where it falls in the run remains a
+  useful secondary signal.
 - **A per-second timeline for C2/C3's fault window.** The result JSON is a
   single post-run summary. Confirming that failures/`RETRY_LATER` cluster
   inside the injection window rather than spreading across the whole run is,

@@ -284,29 +284,38 @@ public final class PartitionOwner {
     byte[] snapshotOf(PoolKey pool) {
         BerthPool berthPool = poolOf(pool);
         return PoolSnapshotCodec.encode(
-                berthPool.segmentCount(), berthPool.snapshotMasks(), berthPool.liveHolds());
+                berthPool.segmentCount(),
+                berthPool.snapshotMasks(),
+                berthIdsByPool.get(pool),
+                berthPool.liveHolds());
     }
 
     /**
-     * Loads a checkpoint's bytes into an <b>already-provisioned</b> pool.
+     * Recreates a pool from a checkpoint's bytes alone: masks, live holds, AND
+     * berth ids. Unlike {@link #provision}, no {@code Provisioned} event is
+     * needed - recovery skips every event at or before the snapshot's offset, and
+     * for a pool that was provisioned long ago that includes its provisioning.
      *
-     * <p>Not yet called by replay (see {@code KafkaSeatAllocator}'s class
-     * Javadoc for why: nothing yet records which pools live on which Kafka
-     * partition, so a newly-assigned owner has no way to know which checkpoints
-     * to load before it has replayed anything). Exists so the checkpoint's own
-     * round trip — write, then reconstruct an identical {@link BerthPool} — is
-     * independently testable ahead of the milestone that wires it in.
+     * @throws IllegalStateException if the bytes are not a current-format snapshot
      */
-    void restorePool(PoolKey pool, byte[] snapshot) {
-        if (!pools.containsKey(pool)) {
-            throw new IllegalStateException("restorePool: pool not provisioned: " + pool);
-        }
+    void restoreFromSnapshot(PoolKey pool, byte[] snapshot) {
         var decoded = PoolSnapshotCodec.decode(snapshot);
+        if (decoded.berthIds().length != decoded.masks().length) {
+            throw new IllegalStateException(
+                    "snapshot for %s has %d berth ids for %d masks"
+                            .formatted(pool, decoded.berthIds().length, decoded.masks().length));
+        }
         pools.put(pool, BerthPool.restore(decoded.segmentCount(), decoded.masks(), decoded.holds()));
+        berthIdsByPool.put(pool, decoded.berthIds());
         for (BerthPool.HoldSnapshot hold : decoded.holds()) {
             poolByHold.put(hold.holdId(), pool);
             holdExpiryByHold.put(hold.holdId(), hold.expiresAt());
         }
+    }
+
+    /** Every pool this owner currently holds. */
+    java.util.Set<PoolKey> poolKeys() {
+        return java.util.Set.copyOf(pools.keySet());
     }
 
     // -------------------------------------------------------------- mapping

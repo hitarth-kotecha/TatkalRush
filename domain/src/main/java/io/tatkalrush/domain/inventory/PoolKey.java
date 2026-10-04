@@ -40,6 +40,28 @@ public record PoolKey(long scheduleId, TravelClass travelClass, QuotaType quotaT
         return scheduleId + ":" + travelClass.code() + ":" + quotaType.code();
     }
 
+    /**
+     * The inverse of {@link #keySuffix()}. Needed by Strategy B's recovery: the
+     * {@code checkpoints} table is keyed by the suffix string, and a new partition
+     * owner has to turn the rows it loads back into pools.
+     *
+     * @throws IllegalArgumentException if {@code suffix} is not {@code id:CLASS:QUOTA}
+     */
+    public static PoolKey parse(String suffix) {
+        String[] parts = suffix.split(":", -1);
+        if (parts.length != 3) {
+            throw new IllegalArgumentException("not a pool key suffix: " + suffix);
+        }
+        try {
+            return new PoolKey(
+                    Long.parseLong(parts[0]),
+                    TravelClass.fromCode(parts[1]),
+                    QuotaType.fromCode(parts[2]));
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("not a pool key suffix: " + suffix, e);
+        }
+    }
+
     @Override
     public String toString() {
         return "pool(" + keySuffix() + ")";

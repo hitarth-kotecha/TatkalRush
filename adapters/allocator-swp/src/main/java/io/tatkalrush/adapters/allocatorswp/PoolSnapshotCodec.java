@@ -23,15 +23,35 @@ import java.util.List;
  */
 final class PoolSnapshotCodec {
 
+    /**
+     * Format marker, so a checkpoint written before berth ids joined the snapshot
+     * is recognised and refused rather than misread: its first int is a segment
+     * count, which can never equal this. Recovery treats a refusal as "no usable
+     * checkpoint" and falls back to a full replay.
+     */
+    private static final int MAGIC = 0x50534E32; // "PSN2"
+
     private PoolSnapshotCodec() {}
 
-    static byte[] encode(int segmentCount, long[] masks, List<BerthPool.HoldSnapshot> holds) {
-        var out = new ByteArrayOutputStream(64 + masks.length * 8);
+    /**
+     * @param berthIds {@code berths.id} per ordinal. They travel with the snapshot
+     *     because recovery restores a pool from it WITHOUT replaying the pool's
+     *     {@code Provisioned} event, which is where they otherwise come from; an
+     *     owner that invented them would corrupt a booking silently.
+     */
+    static byte[] encode(
+            int segmentCount, long[] masks, long[] berthIds, List<BerthPool.HoldSnapshot> holds) {
+        var out = new ByteArrayOutputStream(64 + masks.length * 16);
         try (var data = new DataOutputStream(out)) {
+            data.writeInt(MAGIC);
             data.writeInt(segmentCount);
             data.writeInt(masks.length);
             for (long mask : masks) {
                 data.writeLong(mask);
+            }
+            data.writeInt(berthIds.length);
+            for (long berthId : berthIds) {
+                data.writeLong(berthId);
             }
             data.writeInt(holds.size());
             for (BerthPool.HoldSnapshot hold : holds) {
@@ -51,14 +71,22 @@ final class PoolSnapshotCodec {
         return out.toByteArray();
     }
 
-    record Decoded(int segmentCount, long[] masks, List<BerthPool.HoldSnapshot> holds) {}
+    record Decoded(
+            int segmentCount, long[] masks, long[] berthIds, List<BerthPool.HoldSnapshot> holds) {}
 
     static Decoded decode(byte[] bytes) {
         try (var data = new DataInputStream(new ByteArrayInputStream(bytes))) {
+            if (data.readInt() != MAGIC) {
+                throw new IllegalStateException("pool snapshot is not in the current format");
+            }
             int segmentCount = data.readInt();
             long[] masks = new long[data.readInt()];
             for (int i = 0; i < masks.length; i++) {
                 masks[i] = data.readLong();
+            }
+            long[] berthIds = new long[data.readInt()];
+            for (int i = 0; i < berthIds.length; i++) {
+                berthIds[i] = data.readLong();
             }
 
             int holdCount = data.readInt();
@@ -74,8 +102,9 @@ final class PoolSnapshotCodec {
                 }
                 holds.add(new BerthPool.HoldSnapshot(holdId, ordinals, requestMask, expiresAt));
             }
-            return new Decoded(segmentCount, masks, holds);
+            return new Decoded(segmentCount, masks, berthIds, holds);
         } catch (IOException e) {
+            // Includes EOFException: a truncated or old-format snapshot.
             throw new IllegalStateException("failed to decode pool snapshot", e);
         }
     }
