@@ -1,5 +1,6 @@
 package io.tatkalrush.ops.warmup;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.tatkalrush.adapters.allocatorswp.JdbcCheckpointStore;
 import io.tatkalrush.adapters.allocatorswp.JdbcHoldRoutingStore;
 import io.tatkalrush.adapters.allocatorswp.KafkaSeatAllocator;
@@ -63,7 +64,13 @@ public final class SwpPoolWarmupMain {
                         repliesTopic,
                         Duration.ofSeconds(30),
                         new JdbcCheckpointStore(dataSource),
-                        new JdbcHoldRoutingStore(dataSource));
+                        new JdbcHoldRoutingStore(dataSource),
+                        // A standalone CLI, no Spring context to supply a real
+                        // MeterRegistry - partition_replay_duration_seconds still
+                        // gets recorded, it just has nowhere to be scraped from
+                        // here (this tool provisions from empty, so replay never
+                        // fires anyway - see this class's own Javadoc).
+                        new SimpleMeterRegistry());
         allocator.start();
 
         try (Connection conn = DriverManager.getConnection(args[0], args[1], args[2])) {

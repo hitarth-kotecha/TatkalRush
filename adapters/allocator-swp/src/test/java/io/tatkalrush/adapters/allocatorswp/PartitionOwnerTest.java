@@ -170,7 +170,7 @@ class PartitionOwnerTest {
     }
 
     @Test
-    @DisplayName("snapshotOf/restorePool round-trips a pool's masks and live holds exactly")
+    @DisplayName("snapshotOf/restoreFromSnapshot round-trips a pool's masks, live holds and berth ids with no Provisioned event")
     void checkpointRoundTrip() {
         var pool = pool(9, 2, 4, 900L, 901L);
         allocate(pool, 0, 2, 1, "live");
@@ -180,13 +180,16 @@ class PartitionOwnerTest {
         byte[] snapshot = owner.snapshotOf(pool);
 
         var restored = new PartitionOwner();
-        restored.provision(pool, 2, 4, List.of(900L, 901L)); // berthIds don't travel in the checkpoint
-        restored.restorePool(pool, snapshot);
+        restored.restoreFromSnapshot(pool, snapshot); // nothing provisioned first: the snapshot is enough
 
         assertEquals(
                 owner.availability(pool, SegmentRange.of(0, 4)).freeBerths(),
                 restored.availability(pool, SegmentRange.of(0, 4)).freeBerths());
-        assertInstanceOf(ConfirmResult.Confirmed.class, restored.confirm("live", 1L));
+        var confirmedLive = assertInstanceOf(ConfirmResult.Confirmed.class, restored.confirm("live", 1L));
+        assertEquals(
+                List.of(900L),
+                confirmedLive.berthIds(),
+                "berth ids survived the round trip, or a restored pool would name the wrong berths");
         assertInstanceOf(ConfirmResult.HoldExpired.class, restored.confirm("paid", 2L), "paid: no live hold, by design");
     }
 

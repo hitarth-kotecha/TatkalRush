@@ -18,7 +18,9 @@ Maven phases couples unrelated builds and defeats Docker layer caching for both.
 | `lib/host-paging.ps1` | Samples the Windows host's hard page-ins during a run; heavy paging voids it |
 | `profiles/p1-tatkal-spike.js` | §19.1 P1: ramp to `PEAK_RPS` of TATKAL holds on the one open date |
 | `profiles/p2-sustained-mixed.js` | §19.1 P2: `RATE` sustained, 90 % search / 10 % hold |
+| `profiles/p3-hot-partition.js` | §19.1 P3: P1's load, all of it onto one hot `(train, date, class)` pool — the strategy discriminator |
 | `run-profile.sh` | Driver: preflight → warm-up → reset → run → **drain** → §14 → §19.5 verdict |
+| `chaos/` | §19.2 C1–C4: each a wrapper around `run-profile.sh` that injects one fault at a timed point. See `chaos/README.md`. |
 | `results/` | Per-run JSON. Not committed. |
 | `targets.json` | Generated. Not committed — it describes one seeded database. |
 
@@ -103,3 +105,13 @@ PEAK_RPS=60 ./loadtest/run-profile.sh p1
 ```bash
 RATE=550 ./loadtest/run-profile.sh p2
 ```
+
+```bash
+PEAK_RPS=60 ./loadtest/run-profile.sh p3
+```
+
+AC-2.3 runs P3 against both allocators — restart the stack with
+`tatkal.allocator.strategy=single-writer` (default is `redis-lua`) between the two
+runs. Each result JSON records `allocator_strategy`, read from the running
+container, so the two runs stay distinguishable without hand-tracking which was
+which.

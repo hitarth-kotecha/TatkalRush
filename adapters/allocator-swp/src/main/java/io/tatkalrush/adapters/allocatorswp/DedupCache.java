@@ -37,6 +37,7 @@ final class DedupCache {
 
     private final Duration ttl;
     private final Map<String, CachedReply> entries;
+    private final Runnable onPrematureEviction;
     private long prematureEvictions = 0;
 
     /**
@@ -51,7 +52,20 @@ final class DedupCache {
     private Instant clockAtLastInsert;
 
     DedupCache(int maxEntries, Duration ttl) {
+        this(maxEntries, ttl, () -> {});
+    }
+
+    /**
+     * @param onPrematureEviction called once per premature eviction. The allocator
+     *     passes a Micrometer counter's increment: this cache is discarded on every
+     *     revocation and rebuilt on every replay (DD-007), so {@link
+     *     #prematureEvictions()} alone resets to zero exactly when a rebalance has
+     *     just made undersizing most likely - a correctness signal that forgets on
+     *     the event it exists to catch. The listener outlives the cache.
+     */
+    DedupCache(int maxEntries, Duration ttl, Runnable onPrematureEviction) {
         this.ttl = ttl;
+        this.onPrematureEviction = onPrematureEviction;
         this.entries =
                 new LinkedHashMap<>() {
                     @Override
@@ -61,6 +75,7 @@ final class DedupCache {
                         }
                         if (eldest.getValue().expiresAt().isAfter(clockAtLastInsert)) {
                             prematureEvictions++;
+                            DedupCache.this.onPrematureEviction.run();
                         }
                         return true;
                     }

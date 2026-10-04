@@ -24,6 +24,22 @@
 # Usage:
 #   ./loadtest/run-profile.sh p1 [base-url]
 #   ./loadtest/run-profile.sh p2 [base-url]
+#   ./loadtest/run-profile.sh p3 [base-url]
+#
+# §19.2's chaos scripts (loadtest/chaos/) drive this same sequence rather than
+# duplicating it, through two env vars this script does not otherwise use:
+#
+#   CHAOS_CMD            a shell command backgrounded with a delay, timed against
+#                        the REAL run only (never the discarded warm-up)
+#   CHAOS_DELAY_SECONDS  seconds to wait after the real k6 run starts before
+#                        running CHAOS_CMD
+#   CHAOS_SCENARIO       C1/C2/C3/C4 - when set, this run's request_failures and
+#                        dropped iterations are REPORTED rather than treated as a
+#                        §19.5 defect. A chaos
+#                        injection is expected to fail requests on purpose; the
+#                        three checks §19.5 actually names (rate_limited,
+#                        allocation_constraint_violations_total, §14 invariants)
+#                        are enforced exactly the same either way.
 set -uo pipefail
 
 PROFILE="${1:-}"
@@ -37,21 +53,32 @@ RESULTS="$HERE/results"
 case "$PROFILE" in
   p1) SCRIPT="$HERE/profiles/p1-tatkal-spike.js" ;;
   p2) SCRIPT="$HERE/profiles/p2-sustained-mixed.js" ;;
-  *)  echo "usage: $0 {p1|p2} [base-url]" >&2; exit 2 ;;
+  p3) SCRIPT="$HERE/profiles/p3-hot-partition.js" ;;
+  *)  echo "usage: $0 {p1|p2|p3} [base-url]" >&2; exit 2 ;;
 esac
 
 REDIS_PORT="${TATKAL_REDIS_PORT:-6379}"   # compose.yaml: Windows can reserve 6379
 SETTLE_SECONDS="${SETTLE_SECONDS:-15}"
+CHAOS_CMD="${CHAOS_CMD:-}"
+CHAOS_DELAY_SECONDS="${CHAOS_DELAY_SECONDS:-0}"
+CHAOS_SCENARIO="${CHAOS_SCENARIO:-}"
 
 # The TTL and the clock offset come from the RUNNING SYSTEM, not from this
 # script's environment. Both are inputs to the checks: k6 sizes its users from the
 # TTL (FR-20), and INV-5 judges hold expiries on the system's clock. A script that
 # trusted its own copy ran INV-5 on the host clock against a P40D stack, and the
 # check passed having examined nothing.
-APP_ENV="$(docker compose exec -T app-1 sh -c 'echo "$TATKALRUSH_HOLD_TTLMS $TATKALRUSH_CLOCK_OFFSET"' 2>/dev/null | tr -d '\r')"
-read -r APP_TTL_MS APP_CLOCK_OFFSET <<<"$APP_ENV"
+APP_ENV="$(docker compose exec -T app-1 sh -c 'echo "$TATKALRUSH_HOLD_TTLMS $TATKALRUSH_CLOCK_OFFSET $TATKAL_ALLOCATOR_STRATEGY"' 2>/dev/null | tr -d '\r')"
+read -r APP_TTL_MS APP_CLOCK_OFFSET APP_ALLOCATOR_STRATEGY <<<"$APP_ENV"
 [ -n "${APP_TTL_MS:-}" ] || { echo "cannot read TATKALRUSH_HOLD_TTLMS from app-1 - is the stack up?" >&2; exit 1; }
 APP_CLOCK_OFFSET="${APP_CLOCK_OFFSET:-PT0S}"
+# ApplicationWiring's @ConditionalOnProperty defaults to redis-lua when the
+# property is absent (matchIfMissing = true) - unset here means the same thing
+# it means there, not "unknown". AC-2.3 and AC-2.5's comparison report need to
+# know which strategy a result came from without an operator tracking it by
+# hand, so it travels with the result JSON rather than living only in whichever
+# shell started the stack.
+APP_ALLOCATOR_STRATEGY="${APP_ALLOCATOR_STRATEGY:-redis-lua}"
 HOLD_TTL_SECONDS=$((APP_TTL_MS / 1000))
 
 # §13.2's reaper sweeps every 5 s, so a drained system is at most TTL + one sweep
@@ -80,14 +107,22 @@ echo "================================================================"
 echo " base url        : $BASE"
 echo " hold TTL        : ${HOLD_TTL_SECONDS}s  (from app-1; DD-044 shortens it for benchmark runs)"
 echo " clock offset    : ${APP_CLOCK_OFFSET}  (from app-1; FR-31)"
+echo " allocator       : ${APP_ALLOCATOR_STRATEGY}  (from app-1; §9.4's swap point)"
 echo " quiesce         : until drained, at most ${QUIESCE_TIMEOUT_SECONDS}s"
 echo " run id          : $RUN_ID"
+if [ -n "$CHAOS_CMD" ]; then
+  echo " chaos           : ${CHAOS_SCENARIO:-(unnamed)} - fires ${CHAOS_DELAY_SECONDS}s into the real run"
+fi
 
 # The Tatkal window's open date, computed by the SYSTEM rather than by this
 # script. FR-28's rule is IST calendar arithmetic and reimplementing it in bash
 # would be a second definition that drifts; asking the app which pools it reports
 # as bookable is asking the thing that decides.
-if [ "$PROFILE" = "p1" ]; then
+#
+# P3 needs this exactly as P1 does: hotTarget() (lib/api.js) filters to the same
+# open date, and without TATKAL_DATE set it would throw rather than silently
+# target a closed pool.
+if [ "$PROFILE" = "p1" ] || [ "$PROFILE" = "p3" ]; then
   printf ' open Tatkal date: '
   TATKAL_DATE="$("${PSQL[@]}" -tAc "
     SELECT to_char(min(s.journey_date), 'YYYY-MM-DD')
@@ -152,14 +187,39 @@ if command -v powershell.exe >/dev/null 2>&1; then
   HOST_SAMPLER=$!
 fi
 
+# The chaos hook. Backgrounded here, not before warm-up or reset - CHAOS_DELAY_SECONDS
+# is meant relative to the REAL run's start, and starting the timer any earlier
+# would make every chaos script's delay depend on how long warm-up and reset
+# happened to take on this machine, not on the load shape it actually names.
+CHAOS_PID=""
+if [ -n "$CHAOS_CMD" ]; then
+  ( sleep "$CHAOS_DELAY_SECONDS"; eval "$CHAOS_CMD" ) &
+  CHAOS_PID=$!
+fi
+
 RUN_ID="$RUN_ID" BASE_URL="$BASE" HOLD_TTL_SECONDS="$HOLD_TTL_SECONDS" OUT="$OUT_JSON" \
   "$K6" run --quiet "$SCRIPT" 2>/dev/null | tail -1 > /dev/null
+
+# Waited on rather than left to finish on its own: a C3 freeze/unfreeze pair
+# that outlives the k6 run would leave Postgres frozen for whatever ran next.
+if [ -n "$CHAOS_PID" ]; then wait "$CHAOS_PID" 2>/dev/null; fi
 
 if [ -n "$HOST_SAMPLER" ]; then
   touch "$HOST_STOP"; wait "$HOST_SAMPLER" 2>/dev/null; rm -f "$HOST_STOP"
 fi
 
 [ -s "$OUT_JSON" ] || { echo " k6 produced no result" >&2; exit 1; }
+
+# Which allocator produced this result, folded in before anything else touches
+# the file - AC-2.3's comparison has two of these per profile and nothing else
+# in the JSON says which is which.
+python - "$OUT_JSON" "$APP_ALLOCATOR_STRATEGY" <<'ENDPY'
+import json, sys
+out, strategy = sys.argv[1], sys.argv[2]
+d = json.load(open(out))
+d["allocator_strategy"] = strategy
+json.dump(d, open(out, "w"), indent=2)
+ENDPY
 
 # Folded into the result JSON, so the numbers travel with the run (NFR-12).
 python - "$OUT_JSON" "$HOST_CSV" <<'ENDPY'
@@ -183,11 +243,12 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 rows = [
     ("profile", d.get("profile")),
+    ("allocator", d.get("allocator_strategy", "unknown")),
     ("VUs", "%d" % d.get("vus", 0)),
     ("achieved rps", "%.1f" % d.get("achieved_rps", 0)),
     ("dropped iterations", d.get("dropped_iterations", 0)),
 ]
-if d.get("profile") == "P1":
+if d.get("profile") in ("P1", "P3"):
     rows += [("hold p50/p95/p99 ms", "%.1f / %.1f / %.1f" % (d["p50_ms"], d["p95_ms"], d["p99_ms"]))]
 else:
     rows += [
@@ -201,6 +262,7 @@ rows += [
     ("QUOTA_LOCKED", d.get("quota_locked", 0)),
     ("TOO_MANY_HOLDS", d.get("too_many_holds", 0)),
     ("RATE_LIMITED", d.get("rate_limited", 0)),
+    ("RETRY_LATER", d.get("retry_later", 0)),
     ("failures", d.get("failures", 0)),
 ]
 if "host_page_ins_p50" in d:
@@ -255,13 +317,14 @@ CONSTRAINT_VIOLATIONS="${CONSTRAINT_VIOLATIONS:-0}"
 
 echo
 echo "================================================================"
-python - "$OUT_JSON" "$INVARIANTS_OK" "$CONSTRAINT_VIOLATIONS" "$DRAINED" "$QUIESCE_TIMEOUT_SECONDS" <<'ENDPY'
+python - "$OUT_JSON" "$INVARIANTS_OK" "$CONSTRAINT_VIOLATIONS" "$DRAINED" "$QUIESCE_TIMEOUT_SECONDS" "$CHAOS_SCENARIO" <<'ENDPY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 invariants_ok = sys.argv[2] == "0"
 constraints = float(sys.argv[3] or 0)
 drained = sys.argv[4]
 quiesce_timeout = sys.argv[5]
+chaos_scenario = sys.argv[6]
 
 reasons = []
 # §19.5, in the order the SDD states it.
@@ -291,12 +354,33 @@ if not invariants_ok:
 # Not in §19.5, but the same class of defect one layer down: a step that dropped
 # iterations measured the load generator.
 if d.get("dropped_iterations", 0) > 0:
-    reasons.append(
-        "k6 dropped %d iterations - the load generator was the bottleneck, so this "
-        "run measures the harness" % d["dropped_iterations"])
+    if chaos_scenario:
+        # A stalled backend blocks every VU on a slow response, and k6 drops the
+        # arrivals it has no free VU for. That is what a fault looks like from
+        # the load generator, not a harness bottleneck - the same reason failures
+        # are only reported here. Reported, never silently dropped (NFR-14).
+        print(" NOTE: k6 dropped %d iterations during chaos scenario %s - expected "
+              "when the backend stalls; they should cluster inside the injection "
+              "window." % (d["dropped_iterations"], chaos_scenario))
+    else:
+        reasons.append(
+            "k6 dropped %d iterations - the load generator was the bottleneck, so this "
+            "run measures the harness" % d["dropped_iterations"])
 if d.get("failures", 0) > 0:
-    reasons.append("%d request failures (5xx, timeouts, or unclassified codes)"
-                   % d["failures"])
+    if chaos_scenario:
+        # §19.2's whole point: a chaos scenario deliberately breaks something,
+        # and the write path is EXPECTED to fail requests during the injection
+        # window. Not in §19.5, and not treated as one of run-profile.sh's own
+        # extra reasons either - unlike those, this failure count was caused on
+        # purpose. Reported so it can be checked by hand (do the failures
+        # cluster inside the injection window, not throughout the run?), never
+        # silently dropped (NFR-14).
+        print(" NOTE: %d request failures during chaos scenario %s - expected, "
+              "not a §19.5 defect. Verify by hand that they cluster inside the "
+              "injection window." % (d["failures"], chaos_scenario))
+    else:
+        reasons.append("%d request failures (5xx, timeouts, or unclassified codes)"
+                       % d["failures"])
 # The laptop's pagefile, not the system. See lib/host-paging.ps1.
 #
 # Measured on the reference laptop (7.9 GB): idle host 0-135 page-ins/s; P1 at
@@ -322,8 +406,15 @@ if reasons:
         print("   - %s" % r)
     sys.exit(1)
 
-print(" RUN IS VALID (§19.5): no RATE_LIMITED, no constraint violations,")
-print(" every §14 invariant passed, no dropped iterations, no failures.")
+if chaos_scenario:
+    # Said plainly, because the unconditional line below claimed "no failures" over
+    # a C3 run that had 837 of them.
+    print(" RUN IS VALID (§19.5) as a chaos run: no RATE_LIMITED, no constraint")
+    print(" violations, every §14 invariant passed. Failures and dropped iterations")
+    print(" were expected here and are reported above, not excused by this line.")
+else:
+    print(" RUN IS VALID (§19.5): no RATE_LIMITED, no constraint violations,")
+    print(" every §14 invariant passed, no dropped iterations, no failures.")
 ENDPY
 VERDICT=$?
 echo "================================================================"

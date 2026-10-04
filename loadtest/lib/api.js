@@ -48,6 +48,18 @@ export const quotaLocked = new Counter('holds_quota_locked');
 export const chartPrepared = new Counter('holds_chart_prepared');
 export const tooManyHolds = new Counter('holds_too_many');
 
+/**
+ * DD-006's own documented response to a fenced owner: the client sees a
+ * timeout, which the API maps to RETRY_LATER (HTTP 503), and the client
+ * retries with the same Idempotency-Key. Under P1/P2/P3 this should be zero -
+ * nothing rebalances a partition mid-run - but §19.2's chaos scenarios exist
+ * specifically to make it non-zero, and when they do it is FR-51's "correct
+ * outcome", not a failure. Without this case it fell into the `default` branch
+ * below and counted as request_failures, which would have made every chaos
+ * run that exercises fencing look like a harness defect.
+ */
+export const retryLater = new Counter('holds_retry_later');
+
 /** §19.5's gate. Non-zero VOIDS the run; it is not an error rate to report. */
 export const rateLimited = new Counter('rate_limited_total');
 
@@ -234,6 +246,39 @@ export function tatkalPoolCount() {
   return tatkalPools.length;
 }
 
+/**
+ * The single (train, date, class) pool P3 concentrates 100% of its load onto
+ * (§19.1). FR-49 designates three trains "hot"; `extract-targets.sh` carries
+ * that flag into `targets.json` as `hot`. This picks the FIRST hot TATKAL pool
+ * on the open date - fixed, not random, for the same reason SeedGenerator fixes
+ * which trains are hot: a load profile should be able to name its target
+ * without reading the database first, and two runs of the same profile should
+ * differ in their numbers and nowhere else.
+ *
+ * Deliberately not spread (contrast `tatkalTarget`). Spreading across the hot
+ * pools would measure three partitions under a third of the load each - a
+ * different, easier question. Concentrating on one is the point of P3: it is
+ * the only profile built to make Strategy A and Strategy B disagree.
+ */
+const hotTatkalPools = new SharedArray('hotTatkal', function () {
+  const doc = JSON.parse(open('../targets.json'));
+  const date = __ENV.TATKAL_DATE || '';
+  const pools = doc.targets.filter(function (t) {
+    return t.hot && t.quota_type === 'TATKAL' && (date === '' || t.journey_date === date);
+  });
+  if (pools.length === 0) {
+    throw new Error(
+      `no hot TATKAL targets for date "${date}". P3 needs an open window (AC-1.11), ` +
+        'same as P1: start the stack with TATKAL_CLOCK_OFFSET and pass the matching TATKAL_DATE.',
+    );
+  }
+  return pools;
+});
+
+export function hotTarget() {
+  return hotTatkalPools[0];
+}
+
 // ── requests ────────────────────────────────────────────────────────────────
 
 export function search(target) {
@@ -283,7 +328,9 @@ export function passengersFor(count) {
  * FR-51: a correct outcome and a failure are different things, and only the error
  * code distinguishes them. 409 is SEAT_UNAVAILABLE (correct) and also
  * IDEMPOTENCY_KEY_REUSED (a harness bug); 429 is QUEUE_REQUIRED (correct) and
- * also RATE_LIMITED (voids the run).
+ * also RATE_LIMITED (voids the run); 503 is RETRY_LATER (correct, under chaos)
+ * and also a genuinely unreachable backend (a failure) - the two share a status
+ * code and are told apart only by whether the body says which one this is.
  */
 function classify(res, opts) {
   if (res.status === 200 || res.status === 201) {
@@ -293,6 +340,24 @@ function classify(res, opts) {
       okHolds.add(1);
     }
     return;
+  }
+
+  // RETRY_LATER is checked before the generic 5xx bucket below, not inside the
+  // switch after it: it is DD-006's documented fencing response, HTTP 503, and
+  // the >= 500 check would otherwise catch it first and count a correct chaos
+  // outcome as a system failure. A 503 with no such body (Postgres genuinely
+  // unreachable, no classified response - C3) still falls through to failures.
+  if (res.status === 503) {
+    let retryCode = null;
+    try {
+      retryCode = JSON.parse(res.body).code;
+    } catch (e) {
+      retryCode = null;
+    }
+    if (retryCode === 'RETRY_LATER') {
+      retryLater.add(1);
+      return;
+    }
   }
 
   if (res.status === 0 || res.status >= 500) {
@@ -347,6 +412,7 @@ export function outcomeSummary(data) {
     chart_prepared: c('holds_chart_prepared'),
     too_many_holds: c('holds_too_many'),
     rate_limited: c('rate_limited_total'),
+    retry_later: c('holds_retry_later'),
     failures: c('request_failures'),
   };
 }

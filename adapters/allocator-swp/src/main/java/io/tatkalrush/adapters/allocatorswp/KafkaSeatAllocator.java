@@ -2,6 +2,9 @@ package io.tatkalrush.adapters.allocatorswp;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.FunctionCounter;
+import io.micrometer.core.instrument.MeterRegistry;
 import io.tatkalrush.application.ports.AllocationRequest;
 import io.tatkalrush.application.ports.AllocationResult;
 import io.tatkalrush.application.ports.AvailabilitySnapshot;
@@ -101,18 +104,30 @@ import org.springframework.context.SmartLifecycle;
  * that one would be {@code partition -> [pool]}, needed to bound replay.
  * Solving this one did not require solving that one.
  *
- * <h2>A scope cut, made deliberately and stated plainly</h2>
+ * <h2>Recovery is bounded by checkpoints (DD-049's gap, closed)</h2>
  *
- * <p>{@link #replayPartition} always starts from offset 0 — it does not yet
- * consult the checkpoint it just wrote for this partition's pools to skip ahead.
- * The reason is a real gap in what's tracked: many pools hash onto one Kafka
- * partition (§9.3), the {@code checkpoints} table records one row per <b>pool</b>,
- * and nothing yet records <em>which pools live on which partition</em> — so a
- * newly-assigned owner has no list of checkpoints to even look up before it has
- * replayed anything and discovered its pools from {@code Provisioned} events.
- * Solving that means adding a directory, which is separate scope. Recovery here
- * is therefore <b>correct but not yet bounded</b> — NFR-8's ≤2 s warm-recovery
- * target is not measured or claimed by this milestone.
+ * <p>{@link #replayPartition} loads every checkpoint row for its partition
+ * ({@code checkpoints.kafka_partition}), restores those pools from their
+ * snapshots, and replays only what follows - not from offset 0. Three things
+ * make that safe, and each is easy to break:
+ *
+ * <ul>
+ *   <li>A checkpoint's offset means "complete through this offset of the
+ *       partition's events", not "this pool's last event" - so an idle pool does
+ *       not pin the starting point in the past. {@link #tick} keeps idle pools
+ *       current with a payload-free offset {@code UPDATE}.
+ *   <li>The rows are trusted as the <em>complete</em> list of the partition's
+ *       pools, because provisioning writes a presence marker synchronously before
+ *       the {@code Provisioned} event can commit. A marker, a missing row, an old
+ *       snapshot format or an unreachable Postgres falls back to a full replay.
+ *   <li>A snapshot is never written from state the log does not contain: an
+ *       aborted batch rebuilds the owner from the log first.
+ * </ul>
+ *
+ * <p>The 60-second dedup window is rebuilt from commands, so replay starts no
+ * later than the first event inside it. {@code partition_replay_duration_seconds}
+ * records what this actually costs; NFR-8's budget is checked against that, not
+ * assumed.
  */
 public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, SmartLifecycle {
 
@@ -141,6 +156,15 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
     private final Duration replyTimeout;
     private final ObjectMapper json;
     private final CheckpointStore checkpointStore;
+    private final MeterRegistry meters;
+
+    /**
+     * §9.3's {@code dedup_evictions_before_window_expiry_total}, cumulative across
+     * every cache this JVM has ever owned - not summed from the live caches,
+     * which are discarded on revocation (DD-007) and would take their counts
+     * with them. AC-2.6 requires it to be zero under P1 and P3.
+     */
+    private final Counter dedupPrematureEvictions;
 
     private final ConcurrentHashMap<Integer, PartitionOwner> owners = new ConcurrentHashMap<>();
 
@@ -165,8 +189,31 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
      */
     private final ConcurrentHashMap<Integer, Long> generationByPartition = new ConcurrentHashMap<>();
 
-    /** Debounces checkpoint writes per pool (§9.3: "every 5 seconds"). */
-    private final ConcurrentHashMap<String, Instant> lastCheckpointAt = new ConcurrentHashMap<>();
+    /**
+     * What each currently-owned partition has applied, and what of it is already
+     * durable in {@code checkpoints} - the bookkeeping that decides, per pool,
+     * between "snapshot it", "just move its offset forward" and "nothing to do".
+     */
+    private final ConcurrentHashMap<Integer, PartitionProgress> progressByPartition = new ConcurrentHashMap<>();
+
+    /** Test visibility: how each partition's most recent replay started and what it did. */
+    private final ConcurrentHashMap<Integer, ReplayStats> lastReplayStats = new ConcurrentHashMap<>();
+
+    /** Set by {@link #checkpointNow()}; honoured by the consumer thread, which alone may snapshot. */
+    private volatile boolean forceTick = false;
+
+    /**
+     * {@link #DEDUP_TTL}, except in tests: replay starts no later than the first
+     * event inside this window, so a test that wants to show recovery starting
+     * AFTER offset 0 needs the window shorter than the time it waits. Set before
+     * {@link #start()}, never in production.
+     */
+    private volatile Duration dedupTtl = DEDUP_TTL;
+
+    /** Test support only. */
+    void setDedupTtlForTesting(Duration ttl) {
+        this.dedupTtl = ttl;
+    }
 
     /**
      * DD-013's off-the-consumer-thread writer, for both checkpoint writes and
@@ -210,7 +257,8 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
             String repliesTopic,
             Duration replyTimeout,
             CheckpointStore checkpointStore,
-            HoldRoutingStore holdRoutingStore) {
+            HoldRoutingStore holdRoutingStore,
+            MeterRegistry meters) {
         this.bootstrapServers = bootstrapServers;
         this.commandsTopic = commandsTopic;
         this.eventsTopic = eventsTopic;
@@ -218,6 +266,20 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
         this.replyTimeout = replyTimeout;
         this.checkpointStore = checkpointStore;
         this.holdRoutingStore = holdRoutingStore;
+        this.meters = meters;
+        this.dedupPrematureEvictions =
+                Counter.builder("dedup_evictions_before_window_expiry_total")
+                        .description(
+                                "§9.3/AC-2.6: dedup entries evicted for size before their TTL."
+                                        + " Any non-zero value under P1 or P3 means the cache is"
+                                        + " undersized (DD-009).")
+                        .register(meters);
+        FunctionCounter.builder("orphaned_replies_total", orphanedRepliesTotal, java.util.concurrent.atomic.AtomicLong::get)
+                .description(
+                        "§9.3: replies this replica read that it was not waiting for."
+                                + " Expected to be high with more than one replica - every"
+                                + " replica reads every reply (DD-051).")
+                .register(meters);
         this.json = new ObjectMapper().registerModule(new JavaTimeModule());
         // Deliberately no I/O here — see start().
     }
@@ -311,6 +373,7 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
                 generationByPartition.put(tp.partition(), System.currentTimeMillis());
                 owners.put(tp.partition(), replayed.owner());
                 dedupCaches.put(tp.partition(), replayed.dedupCache());
+                progressByPartition.put(tp.partition(), replayed.progress());
                 ownerProducers.put(tp.partition(), newTransactionalProducer(tp.partition()));
             }
         }
@@ -331,6 +394,7 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
                 // amount. Discard outright rather than keep serving from it.
                 owners.remove(tp.partition());
                 dedupCaches.remove(tp.partition());
+                progressByPartition.remove(tp.partition());
                 generationByPartition.remove(tp.partition());
                 KafkaProducer<String, String> producer = ownerProducers.remove(tp.partition());
                 if (producer != null) {
@@ -340,21 +404,78 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
         }
     }
 
-    private record ReplayResult(PartitionOwner owner, DedupCache dedupCache) {}
+    private record ReplayResult(PartitionOwner owner, DedupCache dedupCache, PartitionProgress progress) {}
 
     /**
-     * Rebuilds a partition's state from {@code booking-events}, from the
-     * beginning (see the class Javadoc for why not from a checkpoint yet) — and
-     * alongside it, the dedup cache (§9.3: "the map is rebuilt from the WAL
-     * during recovery replay").
+     * How a recovery went. {@code startOffset} is the headline: 0 means a full
+     * replay, anything else means checkpoints bounded it.
+     */
+    record ReplayStats(long startOffset, int decoded, int applied, boolean fromCheckpoints) {}
+
+    /**
+     * Bookkeeping for one owned partition's checkpoints. {@code lastEventOffset}
+     * is the highest events-topic offset this owner has applied (live or in
+     * replay); a snapshot taken now is complete through it, because the owner
+     * applies strictly in offset order on one thread.
+     *
+     * <p>{@code lastEventOffsetByPool} is consumer-thread-only. {@code persistedOffset}
+     * is written by the background writer and read by the consumer thread, and
+     * it only ever records what Postgres CONFIRMED - a write the generation guard
+     * silently refused is not recorded, or an idle-pool "advance" would later
+     * vouch for a snapshot that never landed.
+     */
+    private static final class PartitionProgress {
+        volatile long lastEventOffset = -1;
+        volatile Instant lastTickAt = Instant.EPOCH;
+        /** Set when an offset could not be read: stop checkpointing rather than guess. */
+        volatile boolean suspect = false;
+        final Map<PoolKey, Long> lastEventOffsetByPool = new java.util.HashMap<>();
+        final ConcurrentHashMap<PoolKey, Long> persistedOffset = new ConcurrentHashMap<>();
+    }
+
+    /**
+     * Rebuilds a partition's state: from its checkpoints where they form a
+     * usable set, then the tail of {@code booking-events} - and alongside it, the
+     * dedup cache (§9.3: "the map is rebuilt from the WAL during recovery
+     * replay").
      *
      * <p>Uses a manually-assigned consumer, not the consumer group: replay needs
      * to seek to an exact offset and stop at an exact one, which a group
      * membership's rebalance-driven assignment does not give control over.
+     *
+     * <p>Timed end to end, regardless of outcome (DD-049):
+     * {@code partition_replay_duration_seconds}, tagged by partition, is AC-2.2's
+     * and NFR-8/NFR-15's observable recovery-time signal.
      */
     private ReplayResult replayPartition(int partition) {
-        var owner = new PartitionOwner();
-        var dedup = new DedupCache(DEDUP_MAX_ENTRIES, DEDUP_TTL);
+        long startNanos = System.nanoTime();
+        try {
+            return replayPartitionTimed(partition);
+        } finally {
+            meters.timer("partition_replay_duration_seconds", "partition", String.valueOf(partition))
+                    .record(System.nanoTime() - startNanos, TimeUnit.NANOSECONDS);
+        }
+    }
+
+    /**
+     * The checkpoints are trusted only as a COMPLETE set. Provisioning writes a
+     * presence marker for every pool synchronously, so "the rows for this
+     * partition" is the full list of its pools - which is what makes it safe to
+     * skip everything before the oldest of them. Anything that breaks that
+     * (no rows, a marker, an old-format or undecodable snapshot, an offset past
+     * the log's end, Postgres unreachable) falls back to replaying from offset 0,
+     * which is always correct and only slow.
+     *
+     * <p>The starting offset is the lower of two floors. The checkpoints' floor
+     * is the oldest "complete through" offset plus one. The dedup floor is the
+     * first event within {@link #DEDUP_TTL} of now: the dedup cache is rebuilt
+     * from commands, and a retry arriving right after recovery must still be
+     * recognised. Events before a pool's own checkpoint are decoded (for dedup)
+     * but not applied to it.
+     */
+    private ReplayResult replayPartitionTimed(int partition) {
+        var dedup = new DedupCache(DEDUP_MAX_ENTRIES, dedupTtl, dedupPrematureEvictions::increment);
+        var progress = new PartitionProgress();
         var tp = new TopicPartition(eventsTopic, partition);
 
         var props = new Properties();
@@ -365,31 +486,81 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
 
         try (KafkaConsumer<String, String> replay = new KafkaConsumer<>(props)) {
             replay.assign(List.of(tp));
-            replay.seekToBeginning(List.of(tp));
-
             long endOffset = replay.endOffsets(List.of(tp)).get(tp);
-            if (endOffset == 0) {
-                log.info("partition {}: no events to replay", partition);
-                return new ReplayResult(owner, dedup);
+
+            var owner = new PartitionOwner();
+            var checkpointOffsets = new java.util.HashMap<PoolKey, Long>();
+            long checkpointFloor = 0;
+            try {
+                var rows = checkpointStore.loadPartition(partition);
+                if (!rows.isEmpty()) {
+                    long oldest = Long.MAX_VALUE;
+                    for (var row : rows.entrySet()) {
+                        long offset = row.getValue().kafkaOffset();
+                        if (offset < 0) {
+                            throw new IllegalStateException("pool " + row.getKey() + " has only a presence marker");
+                        }
+                        if (offset >= endOffset) {
+                            throw new IllegalStateException(
+                                    "pool %s claims offset %d but the log ends at %d"
+                                            .formatted(row.getKey(), offset, endOffset));
+                        }
+                        PoolKey pool = PoolKey.parse(row.getKey());
+                        owner.restoreFromSnapshot(pool, row.getValue().maskSnapshot());
+                        checkpointOffsets.put(pool, offset);
+                        oldest = Math.min(oldest, offset);
+                    }
+                    checkpointFloor = oldest + 1;
+                }
+            } catch (RuntimeException e) {
+                log.info("partition {}: checkpoints unusable, replaying from the start: {}", partition, e.toString());
+                owner = new PartitionOwner();
+                checkpointOffsets.clear();
+                checkpointFloor = 0;
             }
 
+            long dedupFloor = endOffset;
+            var byTime =
+                    replay.offsetsForTimes(Map.of(tp, Instant.now().minus(dedupTtl).toEpochMilli())).get(tp);
+            if (byTime != null) {
+                dedupFloor = byTime.offset();
+            }
+            long startOffset = Math.min(checkpointFloor, dedupFloor);
+            replay.seek(tp, startOffset);
+
+            checkpointOffsets.forEach(
+                    (pool, offset) -> {
+                        progress.persistedOffset.put(pool, offset);
+                        progress.lastEventOffset = Math.max(progress.lastEventOffset, offset);
+                    });
+
             Instant replayClock = Instant.now();
+            int decoded = 0;
             int applied = 0;
             while (replay.position(tp) < endOffset) {
                 ConsumerRecords<String, String> records = replay.poll(Duration.ofMillis(500));
                 for (ConsumerRecord<String, String> record : records) {
                     PartitionEvent event = decode(record.value(), PartitionEvent.class);
-                    owner.applyEvent(event);
+                    java.util.Optional<PoolKey> pool = poolOf(event);
+
+                    Long checkpointed = pool.map(checkpointOffsets::get).orElse(null);
+                    boolean covered = checkpointed != null && record.offset() <= checkpointed;
+                    if (!covered) {
+                        owner.applyEvent(event);
+                        applied++;
+                        pool.ifPresent(p -> progress.lastEventOffsetByPool.put(p, record.offset()));
+                    }
+                    progress.lastEventOffset = Math.max(progress.lastEventOffset, record.offset());
 
                     // Reconstruct the dedup entry too, expiring relative to WHEN
                     // this event happened, not to now - an entry from 55s ago has
                     // 5s of protection left, not a fresh 60 (§9.3).
                     Instant happenedAt = Instant.ofEpochMilli(record.timestamp());
-                    Instant expiresAt = happenedAt.plus(DEDUP_TTL);
+                    Instant expiresAt = happenedAt.plus(dedupTtl);
                     if (expiresAt.isAfter(replayClock)) {
                         dedup.putWithExpiry(event.commandId(), deriveReply(event), expiresAt, replayClock);
                     }
-                    applied++;
+                    decoded++;
                 }
                 if (records.isEmpty() && replay.position(tp) < endOffset) {
                     // Nothing arrived this poll but we have not reached the
@@ -399,9 +570,18 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
                     log.debug("partition {}: waiting for replay to reach offset {}", partition, endOffset);
                 }
             }
-            log.info("partition {}: replayed {} events up to offset {}", partition, applied, endOffset);
+            boolean fromCheckpoints = !checkpointOffsets.isEmpty();
+            lastReplayStats.put(partition, new ReplayStats(startOffset, decoded, applied, fromCheckpoints));
+            log.info(
+                    "partition {}: replayed from offset {} ({}), {} events decoded, {} applied, up to offset {}",
+                    partition,
+                    startOffset,
+                    fromCheckpoints ? "checkpoints" : "full replay",
+                    decoded,
+                    applied,
+                    endOffset);
+            return new ReplayResult(owner, dedup, progress);
         }
-        return new ReplayResult(owner, dedup);
     }
 
     /**
@@ -649,8 +829,6 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
         }
     }
 
-    private record CheckpointCandidate(PoolKey pool, Future<RecordMetadata> event) {}
-
     private static java.util.Optional<PoolKey> poolOf(PartitionEvent event) {
         return switch (event) {
             case PartitionEvent.Provisioned e -> java.util.Optional.of(e.pool());
@@ -666,52 +844,100 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
     }
 
     /**
-     * Debounced, per pool (§9.3: "every 5 seconds"). The snapshot copy happens
-     * here, on the consumer thread - cheap, and the only part of this that must
-     * not race a later mutation (DD-013). The actual Postgres write is handed to
-     * {@link #backgroundWriter} so it never sits on the hot path.
+     * §9.3's "every 5 seconds", per partition. Runs ONLY on the consumer thread -
+     * the one thread allowed to read the owner's state - either after a batch or
+     * when a poll comes back empty, because an idle partition's last few events
+     * must still reach Postgres.
+     *
+     * <p>For each pool: if it has changed since its snapshot was last confirmed
+     * written (or was never written), snapshot it, complete through the
+     * partition's latest applied offset. If it has NOT changed, its stored
+     * snapshot is still exact, so only its offset moves, in one batched
+     * {@code UPDATE} with no payload. The distinction is what keeps a pool nobody
+     * books from holding recovery's starting point hours in the past.
+     *
+     * <p>The offset claimed must be exact: too low re-applies events the state
+     * already contains, too high skips events it lacks. Hence the checks that stop
+     * all checkpointing the moment an offset cannot be read.
      */
-    private void maybeCheckpoint(
-            int partition, PartitionOwner owner, List<CheckpointCandidate> candidates) {
+    private void tick(int partition, boolean force) {
+        PartitionOwner owner = owners.get(partition);
+        PartitionProgress progress = progressByPartition.get(partition);
+        if (owner == null || progress == null || progress.suspect) {
+            return;
+        }
         Instant now = Instant.now();
+        if (!force && now.isBefore(progress.lastTickAt.plus(CHECKPOINT_INTERVAL))) {
+            return;
+        }
+        long through = progress.lastEventOffset;
+        if (through < 0) {
+            return;
+        }
+        progress.lastTickAt = now;
         long generation = generationByPartition.getOrDefault(partition, 0L);
 
-        // Last candidate per pool wins: only the highest offset in this batch
-        // matters, and re-checkpointing the same pool twice in one batch buys
-        // nothing.
-        var latestPerPool = new java.util.LinkedHashMap<PoolKey, Future<RecordMetadata>>();
-        for (CheckpointCandidate candidate : candidates) {
-            latestPerPool.put(candidate.pool(), candidate.event());
+        var advance = new ArrayList<PoolKey>();
+        for (PoolKey pool : owner.poolKeys()) {
+            long persisted = progress.persistedOffset.getOrDefault(pool, -1L);
+            long changedAt = progress.lastEventOffsetByPool.getOrDefault(pool, -1L);
+            if (persisted < 0 || persisted < changedAt) {
+                byte[] snapshot = owner.snapshotOf(pool);
+                backgroundWriter.submit(
+                        () -> {
+                            try {
+                                if (checkpointStore.save(pool.keySuffix(), partition, through, generation, snapshot)) {
+                                    progress.persistedOffset.merge(pool, through, Math::max);
+                                } else {
+                                    log.debug("checkpoint for {} refused: a newer generation owns it", pool);
+                                }
+                            } catch (RuntimeException e) {
+                                log.warn("checkpoint write failed for pool {}: {}", pool, e.toString());
+                            }
+                        });
+            } else if (persisted < through) {
+                advance.add(pool);
+            }
         }
 
-        for (var entry : latestPerPool.entrySet()) {
-            PoolKey pool = entry.getKey();
-            Instant last = lastCheckpointAt.get(pool.keySuffix());
-            if (last != null && now.isBefore(last.plus(CHECKPOINT_INTERVAL))) {
-                continue;
-            }
-
-            byte[] snapshot = owner.snapshotOf(pool);
-            long offset;
-            try {
-                // Already resolved: commitTransaction() succeeded, which cannot
-                // happen before every send in this transaction is durable.
-                offset = entry.getValue().get().offset();
-            } catch (Exception e) {
-                log.warn("could not read committed offset for pool {}: {}", pool, e.toString());
-                continue;
-            }
-
-            lastCheckpointAt.put(pool.keySuffix(), now);
+        if (!advance.isEmpty()) {
             backgroundWriter.submit(
                     () -> {
                         try {
-                            checkpointStore.save(pool.keySuffix(), offset, generation, snapshot);
+                            var keys = advance.stream().map(PoolKey::keySuffix).toList();
+                            int moved = checkpointStore.advance(partition, generation, through, keys);
+                            if (moved == keys.size()) {
+                                advance.forEach(pool -> progress.persistedOffset.merge(pool, through, Math::max));
+                            } else {
+                                log.debug("checkpoint advance moved {} of {} rows", moved, keys.size());
+                            }
                         } catch (RuntimeException e) {
-                            log.warn("checkpoint write failed for pool {}: {}", pool, e.toString());
+                            log.warn("checkpoint advance failed for partition {}: {}", partition, e.toString());
                         }
                     });
         }
+    }
+
+    /**
+     * Test support only: runs a checkpoint tick for every owned partition now,
+     * ignoring the 5 s debounce, and returns once the writes have landed. The tick
+     * itself still runs on the consumer thread - this only asks for it.
+     */
+    void checkpointNow() throws Exception {
+        forceTick = true;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (forceTick) {
+            if (System.nanoTime() > deadline) {
+                throw new IllegalStateException("consumer thread never ran the requested checkpoint tick");
+            }
+            Thread.sleep(20);
+        }
+        backgroundWriter.submit(() -> {}).get(10, TimeUnit.SECONDS);
+    }
+
+    /** Test support only. */
+    ReplayStats lastReplayStats(int partition) {
+        return lastReplayStats.get(partition);
     }
 
     private void commandLoop() {
@@ -722,7 +948,13 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
             } catch (org.apache.kafka.common.errors.WakeupException e) {
                 continue;
             }
+            if (forceTick) {
+                owners.keySet().forEach(partition -> tick(partition, true));
+                forceTick = false;
+            }
             if (records.isEmpty()) {
+                // An idle partition's last events still have to reach Postgres.
+                owners.keySet().forEach(partition -> tick(partition, false));
                 continue;
             }
 
@@ -751,10 +983,12 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
             return;
         }
 
-        // (pool, event's committed offset) for every state change in this batch
-        // that names a pool - the checkpoint trigger below runs only once the
-        // transaction has actually committed.
-        var checkpointCandidates = new ArrayList<CheckpointCandidate>();
+        PartitionProgress progress = progressByPartition.get(partition);
+        long generation = generationByPartition.getOrDefault(partition, 0L);
+
+        // Every event this batch writes, so the progress bookkeeping below can
+        // read its offset - but only once the transaction has actually committed.
+        var sentEvents = new ArrayList<SentEvent>();
         Instant now = Instant.now();
 
         try {
@@ -777,12 +1011,20 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
                 }
 
                 if (outcome.event() != null) {
+                    // A presence marker, synchronously and BEFORE the commit. Recovery
+                    // trusts a partition's checkpoint rows as the complete list of its
+                    // pools, so a pool must be on that list before its Provisioned
+                    // event can become durable. A failure here aborts the batch: the
+                    // provisioning is reported as failed, not silently unrecoverable.
+                    if (outcome.event() instanceof PartitionEvent.Provisioned provisioned) {
+                        PoolKey pool = provisioned.pool();
+                        checkpointStore.save(pool.keySuffix(), partition, -1, generation, owner.snapshotOf(pool));
+                    }
                     Future<RecordMetadata> sent =
                             transactional.send(
                                     new ProducerRecord<>(
                                             eventsTopic, partition, command.commandId(), encode(outcome.event())));
-                    poolOf(outcome.event())
-                            .ifPresent(pool -> checkpointCandidates.add(new CheckpointCandidate(pool, sent)));
+                    sentEvents.add(new SentEvent(poolOf(outcome.event()), sent));
                 }
                 transactional.send(
                         new ProducerRecord<>(
@@ -792,7 +1034,8 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
                                 encode(outcome.reply())));
             }
             transactional.commitTransaction();
-            maybeCheckpoint(partition, owner, checkpointCandidates);
+            recordCommittedEvents(partition, progress, sentEvents);
+            tick(partition, false);
         } catch (ProducerFencedException e) {
             // DD-006's whole point: this owner no longer holds the partition at
             // the broker level. Neither the WAL appends nor the replies in this
@@ -802,6 +1045,7 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
             log.warn("partition {} owner was fenced; discarding", partition);
             owners.remove(partition);
             dedupCaches.remove(partition);
+            progressByPartition.remove(partition);
             ownerProducers.remove(partition);
             closeQuietly(transactional);
         } catch (RuntimeException e) {
@@ -811,6 +1055,59 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
             } catch (RuntimeException abortFailed) {
                 log.warn("abort itself failed for partition {}: {}", partition, abortFailed.toString());
             }
+            rebuildAfterAbort(partition);
+        }
+    }
+
+    private record SentEvent(java.util.Optional<PoolKey> pool, Future<RecordMetadata> offset) {}
+
+    /**
+     * The committed batch's events are now durable: advance this partition's
+     * progress to their offsets. Must be exact (see {@link #tick}). A future that
+     * cannot be read after a successful commit should be impossible; if it happens
+     * anyway the partition stops checkpointing instead of claiming an offset it
+     * cannot vouch for - recovery then simply uses the older rows.
+     */
+    private void recordCommittedEvents(int partition, PartitionProgress progress, List<SentEvent> sent) {
+        if (progress == null) {
+            return;
+        }
+        for (SentEvent event : sent) {
+            try {
+                long offset = event.offset().get().offset();
+                progress.lastEventOffset = Math.max(progress.lastEventOffset, offset);
+                event.pool().ifPresent(pool -> progress.lastEventOffsetByPool.put(pool, offset));
+            } catch (Exception e) {
+                log.error(
+                        "partition {}: could not read a committed event's offset; checkpointing stops for this tenure: {}",
+                        partition,
+                        e.toString());
+                progress.suspect = true;
+            }
+        }
+    }
+
+    /**
+     * An aborted batch leaves the owner's heap AHEAD of the log: commands were
+     * applied in memory whose events never became durable (DD-007's whole
+     * concern). Serving on, and checkpointing, that state would persist
+     * something that never happened - so rebuild it from the log, as a fresh
+     * assignment would. The aborted batch's commands are not retried here; their
+     * callers time out and retry with the same Idempotency-Key.
+     */
+    private void rebuildAfterAbort(int partition) {
+        try {
+            ReplayResult rebuilt = replayPartition(partition);
+            owners.put(partition, rebuilt.owner());
+            dedupCaches.put(partition, rebuilt.dedupCache());
+            progressByPartition.put(partition, rebuilt.progress());
+        } catch (RuntimeException e) {
+            // Without a trustworthy owner the partition must not serve: removing it
+            // makes processBatch defer to whoever holds the partition next.
+            log.error("partition {}: rebuild after abort failed; giving the partition up: {}", partition, e.toString());
+            owners.remove(partition);
+            dedupCaches.remove(partition);
+            progressByPartition.remove(partition);
         }
     }
 
@@ -935,19 +1232,12 @@ public final class KafkaSeatAllocator implements SeatAllocator, AutoCloseable, S
     }
 
     /**
-     * §9.3's {@code dedup_evictions_before_window_expiry_total}, summed across
-     * this instance's currently-owned partitions. Not yet wired to Micrometer —
-     * this allocator has no composition-root bean to register a meter with
-     * until the multi-instance milestone wires {@code tatkal.allocator.strategy}
-     * (see the M1 wrap-up); a plain counter is what an observer has to ask for
-     * in the meantime.
+     * §9.3's {@code dedup_evictions_before_window_expiry_total}: the same
+     * cumulative Micrometer counter {@code /actuator/prometheus} exposes, across
+     * every cache this instance has owned, including ones since revoked.
      */
     public long dedupPrematureEvictionsTotal() {
-        long total = 0;
-        for (DedupCache cache : dedupCaches.values()) {
-            total += cache.prematureEvictions();
-        }
-        return total;
+        return (long) dedupPrematureEvictions.count();
     }
 
     /**

@@ -2,6 +2,7 @@ package io.tatkalrush.adapters.allocatorswp;
 
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.tatkalrush.application.ports.AllocationRequest;
 import io.tatkalrush.application.ports.AllocationResult;
 import io.tatkalrush.application.ports.ConfirmResult;
@@ -92,12 +93,12 @@ class CrossReplicaHoldRoutingTest {
         replicaA =
                 new KafkaSeatAllocator(
                         KAFKA.getBootstrapServers(), COMMANDS, EVENTS, REPLIES, Duration.ofSeconds(30),
-                        new InMemoryCheckpointStore(), sharedRouting);
+                        new InMemoryCheckpointStore(), sharedRouting, new SimpleMeterRegistry());
         replicaA.start();
         replicaB =
                 new KafkaSeatAllocator(
                         KAFKA.getBootstrapServers(), COMMANDS, EVENTS, REPLIES, Duration.ofSeconds(30),
-                        new InMemoryCheckpointStore(), sharedRouting);
+                        new InMemoryCheckpointStore(), sharedRouting, new SimpleMeterRegistry());
         replicaB.start();
 
         var pool = new PoolKey(1, TravelClass.SL, QuotaType.GENERAL);
@@ -126,12 +127,12 @@ class CrossReplicaHoldRoutingTest {
         replicaA =
                 new KafkaSeatAllocator(
                         KAFKA.getBootstrapServers(), COMMANDS, EVENTS, REPLIES, Duration.ofSeconds(30),
-                        new InMemoryCheckpointStore(), sharedRouting);
+                        new InMemoryCheckpointStore(), sharedRouting, new SimpleMeterRegistry());
         replicaA.start();
         replicaB =
                 new KafkaSeatAllocator(
                         KAFKA.getBootstrapServers(), COMMANDS, EVENTS, REPLIES, Duration.ofSeconds(30),
-                        new InMemoryCheckpointStore(), sharedRouting);
+                        new InMemoryCheckpointStore(), sharedRouting, new SimpleMeterRegistry());
         replicaB.start();
 
         var pool = new PoolKey(2, TravelClass.SL, QuotaType.GENERAL);

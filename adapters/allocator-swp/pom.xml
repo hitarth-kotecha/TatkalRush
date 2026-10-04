@@ -33,6 +33,16 @@
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
     </dependency>
+    <!--
+      partition_replay_duration_seconds (DD-049): main scope, not test-only -
+      KafkaSeatAllocator's own constructor takes a MeterRegistry. Version
+      managed by the root pom's spring-boot-dependencies BOM import, same as
+      spring-kafka and slf4j-api above.
+    -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-core</artifactId>
+    </dependency>
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>

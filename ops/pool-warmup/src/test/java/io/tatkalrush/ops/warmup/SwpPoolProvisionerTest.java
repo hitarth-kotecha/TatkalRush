@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.tatkalrush.adapters.allocatorswp.JdbcCheckpointStore;
 import io.tatkalrush.adapters.allocatorswp.JdbcHoldRoutingStore;
 import io.tatkalrush.adapters.allocatorswp.KafkaSeatAllocator;
@@ -107,7 +108,8 @@ class SwpPoolProvisionerTest {
         allocator =
                 new KafkaSeatAllocator(
                         KAFKA.getBootstrapServers(), COMMANDS, EVENTS, REPLIES, Duration.ofSeconds(30),
-                        new JdbcCheckpointStore(dataSource), new JdbcHoldRoutingStore(dataSource));
+                        new JdbcCheckpointStore(dataSource), new JdbcHoldRoutingStore(dataSource),
+                        new SimpleMeterRegistry());
         allocator.start();
     }
 

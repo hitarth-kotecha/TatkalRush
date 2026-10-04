@@ -215,6 +215,7 @@ public class ApplicationWiring {
     @ConditionalOnProperty(name = "tatkal.allocator.strategy", havingValue = "single-writer")
     SeatAllocator singleWriterSeatAllocator(
             DataSource dataSource,
+            MeterRegistry meters,
             @Value("${spring.kafka.bootstrap-servers:localhost:9092}") String bootstrapServers,
             @Value("${tatkalrush.swp.commands-topic:booking-commands}") String commandsTopic,
             @Value("${tatkalrush.swp.events-topic:booking-events}") String eventsTopic,
@@ -227,7 +228,8 @@ public class ApplicationWiring {
                 repliesTopic,
                 Duration.ofMillis(replyTimeoutMillis),
                 new JdbcCheckpointStore(dataSource),
-                new JdbcHoldRoutingStore(dataSource));
+                new JdbcHoldRoutingStore(dataSource),
+                meters);
     }
 
     @Bean

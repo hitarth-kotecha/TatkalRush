@@ -3,6 +3,7 @@ package io.tatkalrush.adapters.allocatorswp;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import io.tatkalrush.application.ports.AllocationRequest;
 import io.tatkalrush.application.ports.AllocationResult;
 import io.tatkalrush.domain.inventory.PoolKey;
@@ -68,7 +69,7 @@ class DedupIntegrationTest {
         allocator =
                 new KafkaSeatAllocator(
                         KAFKA.getBootstrapServers(), COMMANDS, EVENTS, REPLIES, Duration.ofSeconds(30),
-                        new InMemoryCheckpointStore(), new InMemoryHoldRoutingStore());
+                        new InMemoryCheckpointStore(), new InMemoryHoldRoutingStore(), new SimpleMeterRegistry());
         allocator.start();
     }
 
